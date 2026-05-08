@@ -5,6 +5,7 @@
       "option_symbol": "AAPL260605P00260000",
       "premium_collected": 0.91,
       "fill_price": null,
+      "entry_price": 270.0,
       "cost_basis": null,
       "shares_qty": 0,
       "cycle_start": "2026-05-08",
@@ -20,6 +21,7 @@
   },
   "account_summary": {
     "total_premium_collected": 0.91,
-    "last_daily_summary": null
+    "last_daily_summary": null,
+    "peak_equity": null
   }
 }

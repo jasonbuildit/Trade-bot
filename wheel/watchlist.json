@@ -4,13 +4,15 @@
       "symbol": "AAPL",
       "enabled": true,
       "earnings_date": "2026-07-29",
-      "notes": "Primary wheel candidate — liquid options, high IV"
+      "ex_dividend_date": "2026-08-08",
+      "notes": "Primary wheel candidate — liquid options, high IV. Quarterly dividend ~$0.25."
     },
     {
       "symbol": "KO",
       "enabled": false,
       "earnings_date": "2026-07-22",
-      "notes": "Options illiquid — bid=0 at most strikes, skip"
+      "ex_dividend_date": "2026-06-13",
+      "notes": "Options illiquid — bid=0 at most strikes, skip. Quarterly dividend payer."
     },
     {
       "symbol": "QQQ",

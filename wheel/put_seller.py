@@ -3,8 +3,11 @@ Wheel Strategy — Stage 1: Sell Cash-Secured Put
 Finds the best put contract and places a sell-to-open limit order.
 
 Guardrails enforced:
-  - Cash guard: non_marginable_buying_power >= strike × 100
+  - Duplicate guard: skip if active Stage 1 position already pending fill
+  - Portfolio BP cap: total open puts + new put <= 50% of portfolio value
+  - Min cash reserve: buying_power after trade >= 25% of portfolio value
   - Position size cap: strike × 100 <= max_position_pct × portfolio_value (default 10%)
+  - Cash guard: non_marginable_buying_power >= strike × 100
   - Earnings gate: delegated to screener; put_seller trusts the contract passed in
   - DTE window: 21–45 (theta decay sweet spot)
 
@@ -20,7 +23,11 @@ STATE_FILE = ROOT / "wheel" / "state.json"
 LOG_FILE = ROOT / "trades" / "wheel_log.md"
 WATCHLIST_FILE = ROOT / "wheel" / "watchlist.json"
 
-DEFAULT_MAX_POSITION_PCT = 0.10  # 10% of portfolio per position
+from config import (
+    DEFAULT_MAX_POSITION_PCT,
+    MAX_BP_COMMITTED,
+    MIN_CASH_RESERVE_PCT,
+)
 
 
 def load_state() -> dict:
@@ -110,6 +117,16 @@ def run(
 
     Returns: order details dict or None
     """
+    # ── Duplicate position guard ──────────────────────────────────────────────
+    state_check = load_state()
+    existing_sym = state_check["symbols"].get(symbol, {})
+    if existing_sym.get("stage") == 1 and existing_sym.get("order_status") == "pending_fill":
+        print(
+            f"[put_seller] {symbol}: Stage 1 position already pending fill "
+            f"({existing_sym.get('option_symbol')}) — skipping duplicate entry"
+        )
+        return None
+
     target_strike = round(current_price * 0.90)
     expiry = find_expiry(trading_days)
 
@@ -156,6 +173,32 @@ def run(
             cash_required = strike * 100
             print(f"[put_seller] {symbol}: using lower strike ${strike} = ${cash_required:,.0f}")
 
+    # ── Portfolio-level BP committed cap (50%) ────────────────────────────────
+    if portfolio_value > 0:
+        state_now = load_state()
+        total_committed = sum(
+            s.get("max_risk", 0) or 0
+            for s in state_now["symbols"].values()
+            if s.get("stage") == 1
+        )
+        if (total_committed + cash_required) / portfolio_value > MAX_BP_COMMITTED:
+            print(
+                f"[put_seller] {symbol}: total open puts ${total_committed:,.0f} + "
+                f"new ${cash_required:,.0f} = {(total_committed + cash_required)/portfolio_value:.0%} "
+                f"exceeds {MAX_BP_COMMITTED:.0%} portfolio cap — skipping"
+            )
+            return None
+
+    # ── Min cash reserve (25%) ────────────────────────────────────────────────
+    if portfolio_value > 0:
+        min_reserve = portfolio_value * MIN_CASH_RESERVE_PCT
+        if buying_power - cash_required < min_reserve:
+            print(
+                f"[put_seller] {symbol}: after trade, cash would drop below "
+                f"{MIN_CASH_RESERVE_PCT:.0%} reserve (need ${min_reserve:,.0f} remaining) — skipping"
+            )
+            return None
+
     # ── Cash guard ────────────────────────────────────────────────────────────
     if buying_power < cash_required:
         print(
@@ -199,6 +242,7 @@ def run(
         "option_symbol": contract,
         "premium_collected": bid,
         "fill_price": None,
+        "entry_price": current_price,
         "cost_basis": None,
         "shares_qty": 0,
         "cycle_start": today_str,

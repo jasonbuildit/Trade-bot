@@ -16,6 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent
 STATE_FILE = ROOT / "wheel" / "state.json"
 LOG_FILE = ROOT / "trades" / "wheel_log.md"
+WATCHLIST_FILE = ROOT / "wheel" / "watchlist.json"
 
 
 def load_state() -> dict:
@@ -75,6 +76,24 @@ def find_call_contract(calls: dict, target_strike: float, min_strike: float) -> 
     return candidates[0]
 
 
+def _check_dividend_risk(symbol: str, expiry: str):
+    """Log a warning if ex-dividend date falls before the call expiry (early assignment risk)."""
+    try:
+        with open(WATCHLIST_FILE) as f:
+            data = json.load(f)
+        for item in data.get("symbols", []):
+            if isinstance(item, dict) and item.get("symbol") == symbol:
+                ex_div = item.get("ex_dividend_date")
+                if ex_div and ex_div <= expiry:
+                    print(
+                        f"[call_seller] {symbol}: WARNING — ex-dividend {ex_div} falls "
+                        f"before call expiry {expiry}. Early assignment risk: review before placing."
+                    )
+                break
+    except Exception:
+        pass
+
+
 def run(
     symbol: str,
     cost_basis: float,
@@ -102,6 +121,8 @@ def run(
     if not expiry:
         print(f"[call_seller] {symbol}: no valid expiry found in 21–45 DTE window")
         return None
+
+    _check_dividend_risk(symbol, expiry)
 
     # Filter calls to target expiry
     expiry_calls = {k: v for k, v in calls.items() if expiry.replace("-", "") in k}
