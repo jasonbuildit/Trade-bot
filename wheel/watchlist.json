@@ -1,0 +1,35 @@
+{
+  "symbols": [
+    {
+      "symbol": "AAPL",
+      "enabled": true,
+      "earnings_date": "2026-07-29",
+      "notes": "Primary wheel candidate — liquid options, high IV"
+    },
+    {
+      "symbol": "KO",
+      "enabled": false,
+      "earnings_date": "2026-07-22",
+      "notes": "Options illiquid — bid=0 at most strikes, skip"
+    },
+    {
+      "symbol": "QQQ",
+      "enabled": true,
+      "earnings_date": null,
+      "max_position_pct": 0.07,
+      "notes": "Index ETF — no earnings risk; override position cap to 7% (high strike price)"
+    },
+    {
+      "symbol": "ECC",
+      "enabled": false,
+      "earnings_date": "2026-05-19",
+      "notes": "No liquid options in 21-45 DTE window; also notes redemption event May 8"
+    },
+    {
+      "symbol": "APLE",
+      "enabled": false,
+      "earnings_date": null,
+      "notes": "No liquid options in 21-45 DTE window"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__alpaca__get_account_info",
+      "mcp__alpaca__get_all_positions",
+      "mcp__alpaca__get_clock",
+      "mcp__alpaca__place_option_order",
+      "mcp__alpaca__cancel_order_by_id",
+      "mcp__alpaca__get_orders",
+      "mcp__alpaca__get_stock_latest_trade",
+      "mcp__alpaca__get_option_chain",
+      "mcp__alpaca__get_stock_snapshot",
+      "WebSearch",
+      "mcp__alpaca__get_calendar"
+    ]
+  }
+}
