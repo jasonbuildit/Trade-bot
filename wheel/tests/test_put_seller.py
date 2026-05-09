@@ -61,7 +61,9 @@ class TestDuplicateGuard:
 
     def test_allows_when_filled(self):
         state = make_state({"AAPL": put_symbol_state(order_status="filled")})
-        result = _run(state=state, puts=put_chain(strike=90), price=100.0, dry_run=True)
+        # Bypass sector cap (not what this test is about)
+        with patch("put_seller._sector_of", return_value=None):
+            result = _run(state=state, puts=put_chain(strike=90), price=100.0, dry_run=True)
         assert result is not None
 
 
@@ -104,6 +106,44 @@ class TestMinCashReserve:
     def test_passes_with_enough_reserve(self):
         # bp=40k, cash_required=9k → 31k remaining > 25k reserve ✓
         result = _run(portfolio=100_000.0, bp=40_000.0, puts=put_chain(strike=90), price=100.0, dry_run=True)
+        assert result is not None
+
+
+# ── Sector exposure cap ──────────────────────────────────────────────────────
+
+class TestSectorCap:
+    def _run_with_sector(self, existing_risk=0, symbol=TICKER):
+        existing_sym = {**put_symbol_state(order_status="filled"), "max_risk": existing_risk}
+        state = make_state({symbol: existing_sym})
+        with patch("put_seller._sector_of", return_value="tech"):
+            return _run(puts=put_chain(strike=90), price=100.0, state=state,
+                        bp=50_000.0, portfolio=100_000.0, dry_run=True)
+
+    def test_blocks_when_sector_cap_exceeded(self):
+        # existing tech exposure $22k + new $9k = $31k > 25% of $100k ($25k)
+        result = self._run_with_sector(existing_risk=22_000)
+        assert result is None
+
+    def test_passes_when_sector_has_room(self):
+        # existing $10k + new $9k = $19k < $25k cap
+        result = self._run_with_sector(existing_risk=10_000)
+        assert result is not None
+
+    def test_passes_when_no_sector_tag(self):
+        # symbol has no sector — cap is skipped
+        state = make_state()
+        with patch("put_seller._sector_of", return_value=None):
+            result = _run(puts=put_chain(strike=90), price=100.0, state=state,
+                          bp=50_000.0, portfolio=100_000.0, dry_run=True)
+        assert result is not None
+
+    def test_only_counts_stage1_same_sector(self):
+        # stage=2 position in same sector should not count toward cap
+        stage2_sym = {**put_symbol_state(order_status="filled"), "stage": 2, "max_risk": 20_000}
+        state = make_state({"AAPL": stage2_sym})
+        with patch("put_seller._sector_of", return_value="tech"):
+            result = _run(puts=put_chain(strike=90), price=100.0, state=state,
+                          bp=50_000.0, portfolio=100_000.0, dry_run=True)
         assert result is not None
 
 

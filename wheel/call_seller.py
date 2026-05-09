@@ -157,6 +157,7 @@ def run(
         "symbol": contract, "side": "sell",
         "qty": "1", "position_intent": "sell_to_open",
         "type": "limit", "limit_price": str(limit_price),
+        "time_in_force": "gtc",
     }
 
     # Update state
@@ -180,6 +181,7 @@ def run(
         "roll_count": sym_state.get("roll_count", 0),
         "cycle_number": cycle_number,
         "order_status": "pending_fill",
+        "adjustment_count": 0,
     }
     save_state(state)
 

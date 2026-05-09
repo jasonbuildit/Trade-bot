@@ -34,6 +34,7 @@ from config import (
     UNDERLYING_WARN_PCT,
     UNDERLYING_BLOCK_PCT,
     EARNINGS_PROXIMITY_DAYS,
+    ORDER_ADJUSTMENT_MAX,
 )
 
 ROOT = Path(__file__).parent.parent
@@ -103,18 +104,16 @@ def _in_trading_window(now_et: datetime) -> bool:
     return open_buffer <= now_et <= close_buffer
 
 
-def _reconcile_pending_fills(state: dict, pos_map: dict, open_orders: list) -> None:
+def _reconcile_pending_fills(state: dict, pos_map: dict, open_option_map: dict) -> None:
     """
     Cross-references pending_fill orders against live positions and open orders.
     - Option found in pos_map → order filled; record fill price.
-    - Option absent from both pos_map and open orders → expired/canceled; remove from state.
-    - Option in open orders but not yet in positions → still pending; leave unchanged.
+    - Option absent from both pos_map and open_option_map → expired/canceled; remove from state.
+    - Option in open_option_map but not yet in positions → still pending; leave unchanged.
+    open_option_map: {option_symbol: order_dict} for all open us_option orders.
     Mutates state in place; caller must save.
     """
-    open_option_syms = {
-        o["symbol"] for o in open_orders
-        if o.get("asset_class") == "us_option"
-    }
+    open_option_syms = set(open_option_map.keys())
     today_str = date.today().isoformat()
 
     for symbol in list(state["symbols"].keys()):
@@ -145,6 +144,89 @@ def _reconcile_pending_fills(state: dict, pos_map: dict, open_orders: list) -> N
                 f"Was pending_fill but not found in live positions or open orders. State cleared."
             )
             del state["symbols"][symbol]
+
+
+def _find_contract_bid(option_sym: str, option_chains: dict) -> float | None:
+    """Looks up current bid for a specific contract across all chains."""
+    for sym_chains in option_chains.values():
+        for side in ("puts", "calls"):
+            contracts = sym_chains.get(side, {})
+            if option_sym in contracts:
+                bid = contracts[option_sym].get("latestQuote", {}).get("bp", 0) or 0
+                return float(bid) if bid > 0 else None
+    return None
+
+
+def _adjust_pending_entries(
+    state: dict,
+    open_option_map: dict,
+    option_chains: dict,
+) -> list:
+    """
+    For pending_fill GTC entry orders still sitting in open_option_map:
+    - adjustment_count < ORDER_ADJUSTMENT_MAX: step limit toward current bid, emit replace_order_by_id.
+    - adjustment_count >= ORDER_ADJUSTMENT_MAX: emit cancel_order_by_id, clear state.
+    One adjustment per monitor cycle (15 min cadence).
+    Mutates adjustment_count in state; caller must save.
+    """
+    actions = []
+    for symbol in list(state["symbols"].keys()):
+        sym_state = state["symbols"].get(symbol, {})
+        if sym_state.get("order_status") != "pending_fill":
+            continue
+        option_sym = sym_state.get("option_symbol")
+        if not option_sym or option_sym not in open_option_map:
+            continue
+
+        order = open_option_map[option_sym]
+        order_id = order["id"]
+        adj_count = sym_state.get("adjustment_count", 0)
+
+        if adj_count >= ORDER_ADJUSTMENT_MAX:
+            print(
+                f"[monitor] {symbol}: {option_sym} — "
+                f"{ORDER_ADJUSTMENT_MAX} price adjustments exhausted, canceling GTC order"
+            )
+            del state["symbols"][symbol]
+            actions.append({
+                "symbol": symbol,
+                "action": "cancel_unfilled_entry",
+                "_mcp_call": "cancel_order_by_id",
+                "order_id": order_id,
+            })
+            continue
+
+        bid = _find_contract_bid(option_sym, option_chains)
+        if bid is None or bid <= 0:
+            print(f"[monitor] {symbol}: {option_sym} — no bid data, skipping price adjustment")
+            continue
+
+        current_limit = float(order.get("limit_price") or sym_state.get("premium_collected", 0))
+        if current_limit <= bid:
+            continue  # already at or below bid — nothing to do
+
+        steps_left = ORDER_ADJUSTMENT_MAX - adj_count
+        step = round((current_limit - bid) / steps_left, 2)
+        new_limit = round(max(bid, current_limit - step), 2)
+
+        if new_limit >= current_limit:
+            continue
+
+        print(
+            f"[monitor] {symbol}: adjusting {option_sym} limit "
+            f"${current_limit:.2f} -> ${new_limit:.2f} "
+            f"(bid ${bid:.2f}, adj #{adj_count + 1}/{ORDER_ADJUSTMENT_MAX})"
+        )
+        state["symbols"][symbol]["adjustment_count"] = adj_count + 1
+        actions.append({
+            "symbol": symbol,
+            "action": "adjust_entry_order",
+            "_mcp_call": "replace_order_by_id",
+            "order_id": order_id,
+            "limit_price": str(new_limit),
+        })
+
+    return actions
 
 
 def _can_redeploy(symbol: str, now_et: datetime, sym_meta: dict, drawdown: float) -> bool:
@@ -253,7 +335,11 @@ def run(
 
     state = load_state()
     pos_map = positions_by_symbol(positions)
-    _reconcile_pending_fills(state, pos_map, open_orders)
+    open_option_map = {
+        o["symbol"]: o for o in open_orders
+        if o.get("asset_class") == "us_option"
+    }
+    _reconcile_pending_fills(state, pos_map, open_option_map)
     save_state(state)
     buying_power = float(account.get("non_marginable_buying_power", 0))
     portfolio_value = float(account.get("portfolio_value", 0))
@@ -285,6 +371,13 @@ def run(
     save_state(state)  # persist updated peak_equity
 
     in_window = _in_trading_window(now_et)
+
+    # ── Order execution ladder ────────────────────────────────────────────────
+    # Runs any time market is open — adjusting existing orders is not a new entry
+    ladder_actions = _adjust_pending_entries(state, open_option_map, option_chains)
+    if ladder_actions:
+        actions.extend(ladder_actions)
+        save_state(state)
 
     print(
         f"[monitor] {now_et.strftime('%Y-%m-%d %H:%M ET')} | "
@@ -348,6 +441,10 @@ def run(
                 actions.append({"symbol": symbol, "action": "assigned_to_stage2", "order": result})
 
             elif option_pos is None:
+                if sym_state.get("order_status") == "pending_fill":
+                    # GTC order still open in broker — ladder handles price; nothing else to do
+                    print(f"[monitor] {symbol}: GTC entry order pending fill — waiting")
+                    continue
                 # Put expired worthless — sell a new one if conditions allow
                 print(f"[monitor] {symbol}: put expired worthless")
                 if mode == "pause" or not in_window or underlying_blocked:
@@ -616,14 +713,21 @@ def run(
     if now_et >= close_summary_dt:
         last_summary = state["account_summary"].get("last_daily_summary")
         if last_summary != today:
-            _write_daily_summary(state, pos_map, account, today)
+            summary_text = _write_daily_summary(state, pos_map, account, today)
             state["account_summary"]["last_daily_summary"] = today
             save_state(state)
+            actions.append({
+                "action": "daily_summary_email",
+                "_mcp_call": "create_gmail_draft",
+                "to": "jasonbuildit@gmail.com",
+                "subject": f"Flywheel Daily Summary {today}",
+                "body": summary_text,
+            })
 
     return {"status": "ok", "actions": actions}
 
 
-def _write_daily_summary(state: dict, pos_map: dict, account: dict, today: str):
+def _write_daily_summary(state: dict, pos_map: dict, account: dict, today: str) -> str:
     portfolio_value = float(account.get("portfolio_value", 0))
     total_premium = state["account_summary"].get("total_premium_collected", 0)
 
@@ -676,8 +780,8 @@ def _write_daily_summary(state: dict, pos_map: dict, account: dict, today: str):
 
     summary = "\n".join(lines)
     print(f"\n{'='*60}\n{summary}\n{'='*60}")
-    with open(LOG_FILE, "a") as f:
-        f.write(f"\n{summary}\n")
+    append_log(summary)
+    return summary
 
 
 if __name__ == "__main__":

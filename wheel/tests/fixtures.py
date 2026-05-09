@@ -55,6 +55,7 @@ def put_symbol_state(order_status="filled", option_sym=None):
         "roll_count": 0,
         "cycle_number": 1,
         "order_status": order_status,
+        "adjustment_count": 0,
     }
 
 
@@ -75,6 +76,7 @@ def call_symbol_state(order_status="filled", option_sym=None):
         "roll_count": 0,
         "cycle_number": 1,
         "order_status": order_status,
+        "adjustment_count": 0,
     }
 
 

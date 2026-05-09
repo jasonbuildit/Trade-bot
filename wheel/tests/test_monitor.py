@@ -142,40 +142,110 @@ class TestTradingWindow:
 # ── Reconcile pending fills ───────────────────────────────────────────────────
 
 class TestReconcilePendingFills:
-    def _run(self, state, pos_map, open_orders):
+    def _run(self, state, pos_map, open_option_map):
         with patch("monitor.append_log"):
-            monitor._reconcile_pending_fills(state, pos_map, open_orders)
+            monitor._reconcile_pending_fills(state, pos_map, open_option_map)
 
     def test_fill_detected(self):
         state = make_state({"AAPL": put_symbol_state(order_status="pending_fill")})
         pos_map = {PUT_SYM: {"avg_entry_price": "0.94", "symbol": PUT_SYM}}
-        self._run(state, pos_map, [])
+        self._run(state, pos_map, {})
         assert state["symbols"]["AAPL"]["order_status"] == "filled"
         assert state["symbols"]["AAPL"]["fill_price"] == pytest.approx(0.94)
 
     def test_expired_clears_symbol(self):
         state = make_state({"AAPL": put_symbol_state(order_status="pending_fill")})
-        self._run(state, {}, [])  # not in positions, not in open orders
+        self._run(state, {}, {})  # not in positions, not in open orders
         assert "AAPL" not in state["symbols"]
 
     def test_still_pending_unchanged(self):
         sym_state = put_symbol_state(order_status="pending_fill")
         state = make_state({"AAPL": sym_state})
         open_order = {"symbol": PUT_SYM, "asset_class": "us_option"}
-        self._run(state, {}, [open_order])
+        self._run(state, {}, {PUT_SYM: open_order})
         assert state["symbols"]["AAPL"]["order_status"] == "pending_fill"
 
     def test_already_filled_skipped(self):
         state = make_state({"AAPL": put_symbol_state(order_status="filled")})
         # Even though it's not in pos_map, should not be re-processed
-        self._run(state, {}, [])
+        self._run(state, {}, {})
         assert "AAPL" in state["symbols"]
 
     def test_no_option_symbol_skipped(self):
         sym = {**put_symbol_state(order_status="pending_fill"), "option_symbol": None}
         state = make_state({"AAPL": sym})
-        self._run(state, {}, [])
+        self._run(state, {}, {})
         assert "AAPL" in state["symbols"]  # no option_symbol → skip
+
+
+# ── Order execution ladder ────────────────────────────────────────────────────
+
+class TestOrderLadder:
+    ORDER_ID = "order-ladder-abc"
+
+    def _open_order(self, limit_price="0.96"):
+        return {
+            "id": self.ORDER_ID,
+            "symbol": PUT_SYM,
+            "asset_class": "us_option",
+            "limit_price": limit_price,
+        }
+
+    def _chains(self, bid=0.80, ask=1.02):
+        return {"AAPL": {"puts": {PUT_SYM: {"latestQuote": {"bp": bid, "ap": ask}}}, "calls": {}}}
+
+    def test_adjusts_limit_toward_bid(self):
+        state = make_state({"AAPL": put_symbol_state(order_status="pending_fill")})
+        open_map = {PUT_SYM: self._open_order("0.96")}
+        actions = monitor._adjust_pending_entries(state, open_map, self._chains(bid=0.80))
+        assert len(actions) == 1
+        assert actions[0]["action"] == "adjust_entry_order"
+        assert actions[0]["_mcp_call"] == "replace_order_by_id"
+        new_limit = float(actions[0]["limit_price"])
+        assert 0.80 <= new_limit < 0.96
+        assert state["symbols"]["AAPL"]["adjustment_count"] == 1
+
+    def test_step_divides_gap_evenly(self):
+        # gap = 0.96 - 0.60 = 0.36; 3 steps = 0.12 each; first step → 0.84
+        state = make_state({"AAPL": put_symbol_state(order_status="pending_fill")})
+        open_map = {PUT_SYM: self._open_order("0.96")}
+        actions = monitor._adjust_pending_entries(state, open_map, self._chains(bid=0.60))
+        new_limit = float(actions[0]["limit_price"])
+        assert new_limit == pytest.approx(0.84, abs=0.01)
+
+    def test_cancels_after_max_adjustments(self):
+        sym = {**put_symbol_state(order_status="pending_fill"), "adjustment_count": 3}
+        state = make_state({"AAPL": sym})
+        open_map = {PUT_SYM: self._open_order("0.80")}
+        actions = monitor._adjust_pending_entries(state, open_map, self._chains())
+        assert len(actions) == 1
+        assert actions[0]["action"] == "cancel_unfilled_entry"
+        assert actions[0]["_mcp_call"] == "cancel_order_by_id"
+        assert actions[0]["order_id"] == self.ORDER_ID
+        assert "AAPL" not in state["symbols"]
+
+    def test_no_adjustment_when_not_in_open_orders(self):
+        state = make_state({"AAPL": put_symbol_state(order_status="pending_fill")})
+        actions = monitor._adjust_pending_entries(state, {}, self._chains())
+        assert actions == []
+
+    def test_no_adjustment_when_filled(self):
+        state = make_state({"AAPL": put_symbol_state(order_status="filled")})
+        open_map = {PUT_SYM: self._open_order()}
+        actions = monitor._adjust_pending_entries(state, open_map, self._chains())
+        assert actions == []
+
+    def test_no_adjustment_when_at_bid(self):
+        state = make_state({"AAPL": put_symbol_state(order_status="pending_fill")})
+        open_map = {PUT_SYM: self._open_order("0.80")}
+        actions = monitor._adjust_pending_entries(state, open_map, self._chains(bid=0.80))
+        assert actions == []
+
+    def test_no_adjustment_when_no_bid_data(self):
+        state = make_state({"AAPL": put_symbol_state(order_status="pending_fill")})
+        open_map = {PUT_SYM: self._open_order("0.96")}
+        actions = monitor._adjust_pending_entries(state, open_map, {})
+        assert actions == []
 
 
 # ── Assignment guard (partial shares) ────────────────────────────────────────

@@ -44,3 +44,9 @@ UNDERLYING_BLOCK_PCT = 0.15  # block new puts if stock/assigned shares down 15%
 
 # ── Pre-entry event gate ─────────────────────────────────────────────────────
 EARNINGS_PROXIMITY_DAYS = 14  # block redeployment if earnings within 14 days
+
+# ── Sector exposure cap ──────────────────────────────────────────────────────
+MAX_SECTOR_EXPOSURE = 0.25  # max 25% of portfolio in puts on correlated names (same sector)
+
+# ── Order execution ladder ───────────────────────────────────────────────────
+ORDER_ADJUSTMENT_MAX = 3  # max price adjustments per entry order (one per monitor cycle)

@@ -149,6 +149,15 @@ mcp__alpaca__place_option_order(symbol=contract, side="sell", qty="1",
 
 Multi-leg rolls use `order_class="mleg"` with a `legs` list. The `limit_price` is negative for credits.
 
+Full `_mcp_call` dispatch table:
+
+| `_mcp_call` value | Claude executes |
+|---|---|
+| `place_option_order` | `mcp__alpaca__place_option_order(symbol, side, qty, position_intent, type, limit_price, time_in_force)` |
+| `replace_order_by_id` | `mcp__alpaca__replace_order_by_id(order_id, limit_price)` |
+| `cancel_order_by_id` | `mcp__alpaca__cancel_order_by_id(order_id)` |
+| `create_gmail_draft` | `mcp__claude_ai_Gmail__create_draft(to, subject, body)` |
+
 ## Scheduled Skills
 
 | Skill / Command | Trigger | Action |

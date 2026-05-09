@@ -27,6 +27,7 @@ from config import (
     DEFAULT_MAX_POSITION_PCT,
     MAX_BP_COMMITTED,
     MIN_CASH_RESERVE_PCT,
+    MAX_SECTOR_EXPOSURE,
 )
 from occ import find_expiry, parse_strike, expiry_tag as _expiry_tag
 
@@ -44,6 +45,18 @@ def save_state(state: dict):
 def append_log(entry: str):
     with open(LOG_FILE, "a") as f:
         f.write(f"\n{entry}\n")
+
+
+def _sector_of(symbol: str) -> str | None:
+    try:
+        with open(WATCHLIST_FILE) as f:
+            data = json.load(f)
+        for item in data.get("symbols", []):
+            if isinstance(item, dict) and item.get("symbol") == symbol:
+                return item.get("sector")
+    except Exception:
+        pass
+    return None
 
 
 def _max_position_pct(symbol: str) -> float:
@@ -178,6 +191,26 @@ def run(
             )
             return None
 
+    # ── Sector exposure cap (25%) ─────────────────────────────────────────────
+    if portfolio_value > 0:
+        sector = _sector_of(symbol)
+        if sector:
+            state_sector = load_state()
+            sector_committed = sum(
+                s.get("max_risk", 0) or 0
+                for sym, s in state_sector["symbols"].items()
+                if s.get("stage") == 1 and _sector_of(sym) == sector
+            )
+            max_sector_cash = portfolio_value * MAX_SECTOR_EXPOSURE
+            if sector_committed + cash_required > max_sector_cash:
+                print(
+                    f"[put_seller] {symbol}: sector '{sector}' exposure "
+                    f"${sector_committed:,.0f} + new ${cash_required:,.0f} "
+                    f"= {(sector_committed + cash_required)/portfolio_value:.0%} "
+                    f"exceeds {MAX_SECTOR_EXPOSURE:.0%} sector cap — skipping"
+                )
+                return None
+
     # ── Min cash reserve (25%) ────────────────────────────────────────────────
     if portfolio_value > 0:
         min_reserve = portfolio_value * MIN_CASH_RESERVE_PCT
@@ -213,6 +246,7 @@ def run(
         "symbol": contract, "side": "sell",
         "qty": "1", "position_intent": "sell_to_open",
         "type": "limit", "limit_price": str(limit_price),
+        "time_in_force": "gtc",
     }
 
     # Derived analytics (use limit_price as expected premium)
@@ -242,6 +276,7 @@ def run(
         "roll_count": 0,
         "cycle_number": cycle_number,
         "order_status": "pending_fill",
+        "adjustment_count": 0,
     }
     state["account_summary"]["total_premium_collected"] = round(
         sum(s.get("total_premium_all_cycles", 0) for s in state["symbols"].values()), 4

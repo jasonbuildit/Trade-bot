@@ -29,7 +29,7 @@ FAIL = "\033[31mFAIL\033[0m"
 _failures = []
 
 
-def run_scenario(state, positions, open_orders=None, clock=CLOCK_OPEN, account=None):
+def run_scenario(state, positions, open_orders=None, clock=CLOCK_OPEN, account=None, option_chains=None):
     with (
         patch("monitor.load_state", return_value=state),
         patch("monitor.save_state"),
@@ -48,7 +48,7 @@ def run_scenario(state, positions, open_orders=None, clock=CLOCK_OPEN, account=N
             positions=positions or [],
             open_orders=open_orders or [],
             account=account or ACCOUNT,
-            option_chains=CHAINS,
+            option_chains=option_chains or CHAINS,
             trading_days=TRADING_DAYS,
             snapshots=SNAPSHOT,
             dry_run=True,
@@ -175,6 +175,33 @@ actions = result.get("actions", [])
 check("action is called_away_to_stage1", any(a.get("action") == "called_away_to_stage1" for a in actions))
 
 
+# ── Order ladder: GTC adjustment ─────────────────────────────────────────────
+
+LADDER_CHAINS = {"AAPL": {"puts": {PUT_SYM: {"latestQuote": {"bp": 0.80, "ap": 1.02}}}, "calls": {}}}
+
+scenario("11. Pending GTC order, adj_count=0 -> limit adjusted toward bid")
+state = make_state({"AAPL": put_symbol_state(order_status="pending_fill")})
+open_order = {"id": "order-ladder-test", "symbol": PUT_SYM, "asset_class": "us_option", "limit_price": "0.96"}
+result = run_scenario(state, positions=[], open_orders=[open_order], option_chains=LADDER_CHAINS)
+actions = result.get("actions", [])
+check("adjust_entry_order action emitted", any(a.get("action") == "adjust_entry_order" for a in actions))
+action = next((a for a in actions if a.get("action") == "adjust_entry_order"), {})
+check("new limit lower than original", float(action.get("limit_price", "99")) < 0.96)
+check("replace_order_by_id dispatched", action.get("_mcp_call") == "replace_order_by_id")
+
+
+# ── Order ladder: max adjustments → cancel ───────────────────────────────────
+
+scenario("12. Pending GTC order, adj_count=3 -> cancel action emitted")
+state = make_state({"AAPL": {**put_symbol_state(order_status="pending_fill"), "adjustment_count": 3}})
+open_order = {"id": "order-ladder-cancel", "symbol": PUT_SYM, "asset_class": "us_option", "limit_price": "0.80"}
+result = run_scenario(state, positions=[], open_orders=[open_order], option_chains=LADDER_CHAINS)
+actions = result.get("actions", [])
+check("cancel_unfilled_entry action emitted", any(a.get("action") == "cancel_unfilled_entry" for a in actions))
+action = next((a for a in actions if a.get("action") == "cancel_unfilled_entry"), {})
+check("cancel_order_by_id dispatched", action.get("_mcp_call") == "cancel_order_by_id")
+
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 print(f"\n{'='*50}")
@@ -184,5 +211,5 @@ if _failures:
         print(f"  • {f}")
     sys.exit(1)
 else:
-    total = 10  # number of scenario blocks
+    total = 12  # number of scenario blocks
     print(f"All smoke tests passed")
