@@ -70,7 +70,7 @@ def roll_put_down_and_out(
         print(f"[roller] {symbol}: no later expiry found in 21-45 DTE — cannot roll")
         return None
 
-    expiry_tag = new_expiry.replace("-", "")
+    expiry_tag = new_expiry.replace("-", "")[2:]  # OCC uses YYMMDD, not YYYYMMDD
 
     # Candidate replacement contracts: same or lower strike, new expiry, valid bid
     candidates = []
@@ -167,7 +167,7 @@ def roll_call_up_and_out(
         print(f"[roller] {symbol}: no later expiry found in 21-45 DTE — cannot roll call")
         return None
 
-    expiry_tag = new_expiry.replace("-", "")
+    expiry_tag = new_expiry.replace("-", "")[2:]  # OCC uses YYMMDD, not YYYYMMDD
 
     # Candidate replacement contracts: higher strike, above effective_basis, new expiry
     candidates = []

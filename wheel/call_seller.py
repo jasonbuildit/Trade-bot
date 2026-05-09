@@ -65,9 +65,10 @@ def find_call_contract(calls: dict, target_strike: float, min_strike: float) -> 
         if strike < min_strike:
             continue
         bid = data.get("latestQuote", {}).get("bp", 0) or 0
+        ask = data.get("latestQuote", {}).get("ap", 0) or 0
         if bid <= 0:
             continue
-        candidates.append({"contract": contract, "strike": strike, "bid": bid})
+        candidates.append({"contract": contract, "strike": strike, "bid": bid, "ask": ask})
 
     if not candidates:
         return None
@@ -112,6 +113,16 @@ def run(
 
     Returns: order details dict or None
     """
+    # ── Duplicate position guard ──────────────────────────────────────────────
+    state_check = load_state()
+    existing = state_check["symbols"].get(symbol, {})
+    if existing.get("stage") == 2 and existing.get("order_status") == "pending_fill":
+        print(
+            f"[call_seller] {symbol}: Stage 2 call already pending fill "
+            f"({existing.get('option_symbol')}) — skipping duplicate entry"
+        )
+        return None
+
     # Never sell call below effective cost basis
     effective_basis = cost_basis - premiums_collected
     target_strike = round(cost_basis * 1.10)
@@ -125,7 +136,7 @@ def run(
     _check_dividend_risk(symbol, expiry)
 
     # Filter calls to target expiry
-    expiry_calls = {k: v for k, v in calls.items() if expiry.replace("-", "") in k}
+    expiry_calls = {k: v for k, v in calls.items() if expiry.replace("-", "")[2:] in k}
     if not expiry_calls:
         expiry_calls = calls
 
@@ -140,24 +151,26 @@ def run(
     contract = contract_info["contract"]
     strike = contract_info["strike"]
     bid = contract_info["bid"]
+    ask = contract_info.get("ask", 0)
+    limit_price = round((bid + ask) / 2, 2) if ask > bid else bid
 
     print(
         f"[call_seller] {symbol}: selling {contract} | strike ${strike} | "
-        f"bid ${bid} | expiry {expiry} | effective basis ${effective_basis:.2f}"
+        f"limit ${limit_price} (bid ${bid} / ask ${ask}) | expiry {expiry} | effective basis ${effective_basis:.2f}"
     )
 
     if dry_run:
         print(f"[call_seller] DRY RUN — no order placed")
-        return {"dry_run": True, "contract": contract, "strike": strike, "bid": bid}
+        return {"dry_run": True, "contract": contract, "strike": strike, "limit_price": limit_price}
 
     # Place order — Claude calls this MCP tool:
     # mcp__alpaca__place_option_order(symbol=contract, side="sell", qty="1",
-    #   position_intent="sell_to_open", type="limit", limit_price=str(bid))
+    #   position_intent="sell_to_open", type="limit", limit_price=str(limit_price))
     order_result = {
         "_mcp_call": "place_option_order",
         "symbol": contract, "side": "sell",
         "qty": "1", "position_intent": "sell_to_open",
-        "type": "limit", "limit_price": str(bid),
+        "type": "limit", "limit_price": str(limit_price),
     }
 
     # Update state
@@ -170,14 +183,14 @@ def run(
         **sym_state,
         "stage": 2,
         "option_symbol": contract,
-        "premium_collected": bid,
+        "premium_collected": limit_price,
         "fill_price": None,
         "cost_basis": cost_basis,
         "shares_qty": 100,
         "expiry_date": expiry,
         "breakeven": None,
         "max_risk": None,
-        "total_premium_all_cycles": round(prev_premium + bid, 4),
+        "total_premium_all_cycles": round(prev_premium + limit_price, 4),
         "roll_count": sym_state.get("roll_count", 0),
         "cycle_number": cycle_number,
         "order_status": "pending_fill",
@@ -188,7 +201,7 @@ def run(
     append_log(
         f"## {today_str} — Stage 2 Entry (Assignment) Cycle #{cycle_number}\n"
         f"Symbol: {symbol} | Assigned at ${cost_basis:.2f} | Sold call: {contract} | "
-        f"Strike: ${strike} | Expiry: {expiry} | Premium: ${bid} | "
+        f"Strike: ${strike} | Expiry: {expiry} | Limit: ${limit_price} (bid ${bid} / ask ${ask}) | "
         f"Effective basis: ${effective_basis:.2f}"
     )
 

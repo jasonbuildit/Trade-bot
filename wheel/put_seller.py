@@ -86,9 +86,10 @@ def find_put_contract(puts: dict, target_strike: float) -> dict | None:
         except Exception:
             continue
         bid = data.get("latestQuote", {}).get("bp", 0) or 0
+        ask = data.get("latestQuote", {}).get("ap", 0) or 0
         if bid <= 0:
             continue
-        candidates.append({"contract": contract, "strike": strike, "bid": bid, "data": data})
+        candidates.append({"contract": contract, "strike": strike, "bid": bid, "ask": ask, "data": data})
 
     if not candidates:
         return None
@@ -135,7 +136,7 @@ def run(
         return None
 
     # Filter puts to target expiry
-    expiry_puts = {k: v for k, v in puts.items() if expiry.replace("-", "") in k}
+    expiry_puts = {k: v for k, v in puts.items() if expiry.replace("-", "")[2:] in k}
     if not expiry_puts:
         expiry_puts = puts
 
@@ -147,6 +148,8 @@ def run(
     contract = contract_info["contract"]
     strike = contract_info["strike"]
     bid = contract_info["bid"]
+    ask = contract_info.get("ask", 0)
+    limit_price = round((bid + ask) / 2, 2) if ask > bid else bid
     cash_required = strike * 100
 
     # ── Position size cap ─────────────────────────────────────────────────────
@@ -170,6 +173,8 @@ def run(
             contract = fallback["contract"]
             strike = fallback["strike"]
             bid = fallback["bid"]
+            ask = fallback.get("ask", 0)
+            limit_price = round((bid + ask) / 2, 2) if ask > bid else bid
             cash_required = strike * 100
             print(f"[put_seller] {symbol}: using lower strike ${strike} = ${cash_required:,.0f}")
 
@@ -209,26 +214,26 @@ def run(
 
     print(
         f"[put_seller] {symbol}: selling {contract} | strike ${strike} | "
-        f"bid ${bid} | expiry {expiry} | cash required ${cash_required:,.0f}"
+        f"limit ${limit_price} (bid ${bid} / ask ${ask}) | expiry {expiry} | cash required ${cash_required:,.0f}"
     )
 
     if dry_run:
         print(f"[put_seller] DRY RUN — no order placed")
-        return {"dry_run": True, "contract": contract, "strike": strike, "bid": bid}
+        return {"dry_run": True, "contract": contract, "strike": strike, "limit_price": limit_price}
 
     # Place order — Claude calls this MCP tool:
     # mcp__alpaca__place_option_order(symbol=contract, side="sell", qty="1",
-    #   position_intent="sell_to_open", type="limit", limit_price=str(bid))
+    #   position_intent="sell_to_open", type="limit", limit_price=str(limit_price))
     order_result = {
         "_mcp_call": "place_option_order",
         "symbol": contract, "side": "sell",
         "qty": "1", "position_intent": "sell_to_open",
-        "type": "limit", "limit_price": str(bid),
+        "type": "limit", "limit_price": str(limit_price),
     }
 
-    # Derived analytics
-    breakeven = round(strike - bid, 2)
-    max_risk = round((strike - bid) * 100, 2)
+    # Derived analytics (use limit_price as expected premium)
+    breakeven = round(strike - limit_price, 2)
+    max_risk = round((strike - limit_price) * 100, 2)
 
     # Update state
     state = load_state()
@@ -240,7 +245,7 @@ def run(
     state["symbols"][symbol] = {
         "stage": 1,
         "option_symbol": contract,
-        "premium_collected": bid,
+        "premium_collected": limit_price,
         "fill_price": None,
         "entry_price": current_price,
         "cost_basis": None,
@@ -249,7 +254,7 @@ def run(
         "expiry_date": expiry,
         "breakeven": breakeven,
         "max_risk": max_risk,
-        "total_premium_all_cycles": round(prev_premium + bid, 4),
+        "total_premium_all_cycles": round(prev_premium + limit_price, 4),
         "roll_count": 0,
         "cycle_number": cycle_number,
         "order_status": "pending_fill",
@@ -262,7 +267,7 @@ def run(
     append_log(
         f"## {today_str} — Stage 1 Entry (Cycle #{cycle_number})\n"
         f"Symbol: {symbol} | Sold put: {contract} | Strike: ${strike} | "
-        f"Expiry: {expiry} | Premium: ${bid} | Cash reserved: ${cash_required:,.0f} | "
+        f"Expiry: {expiry} | Limit: ${limit_price} (bid ${bid} / ask ${ask}) | Cash reserved: ${cash_required:,.0f} | "
         f"Breakeven: ${breakeven} | Max risk: ${max_risk:,.0f}"
     )
 

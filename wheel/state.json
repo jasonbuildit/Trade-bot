@@ -1,26 +1,7 @@
 {
-  "symbols": {
-    "AAPL": {
-      "stage": 1,
-      "option_symbol": "AAPL260605P00260000",
-      "premium_collected": 0.91,
-      "fill_price": null,
-      "entry_price": 270.0,
-      "cost_basis": null,
-      "shares_qty": 0,
-      "cycle_start": "2026-05-08",
-      "expiry_date": "2026-06-05",
-      "breakeven": 259.09,
-      "max_risk": 25909.0,
-      "total_premium_all_cycles": 0.91,
-      "roll_count": 0,
-      "cycle_number": 1,
-      "order_id": "7bfafdee-25d3-45c4-84c0-512474fb2b68",
-      "order_status": "pending_fill"
-    }
-  },
+  "symbols": {},
   "account_summary": {
-    "total_premium_collected": 0.91,
+    "total_premium_collected": 0.0,
     "last_daily_summary": null,
     "peak_equity": null
   }
