@@ -19,6 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent
 
 from config import DELTA_MIN, DELTA_MAX, SPREAD_MAX, IV_FLOOR
+from occ import parse_strike, parse_expiry
 
 
 def load_watchlist() -> list[dict]:
@@ -78,16 +79,13 @@ def score_candidate(
             skipped["no_bid"] += 1
             continue
 
-        # Parse strike from OCC symbol: last 8 chars = strike * 1000
         try:
-            strike = int(contract[-8:]) / 1000
+            strike = parse_strike(contract)
         except Exception:
             continue
 
-        # Parse expiry from OCC symbol: chars 6-13 = YYMMDD
         try:
-            exp_str = "20" + contract[len(symbol):len(symbol)+6]
-            expiry_date_str = f"{exp_str[:4]}-{exp_str[4:6]}-{exp_str[6:8]}"
+            expiry_date_str = parse_expiry(contract, symbol)
             days = dte(expiry_date_str)
         except Exception:
             days = None

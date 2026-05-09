@@ -28,6 +28,7 @@ from config import (
     MAX_BP_COMMITTED,
     MIN_CASH_RESERVE_PCT,
 )
+from occ import find_expiry, parse_strike, expiry_tag as _expiry_tag
 
 
 def load_state() -> dict:
@@ -57,23 +58,6 @@ def _max_position_pct(symbol: str) -> float:
     return DEFAULT_MAX_POSITION_PCT
 
 
-def find_expiry(trading_days: list, min_dte: int = 21, max_dte: int = 45) -> str | None:
-    today = date.today()
-    # Prefer a Friday
-    for day in trading_days:
-        d = date.fromisoformat(day["date"])
-        delta = (d - today).days
-        if min_dte <= delta <= max_dte and d.weekday() == 4:
-            return day["date"]
-    # Fallback: any trading day in range
-    for day in trading_days:
-        d = date.fromisoformat(day["date"])
-        delta = (d - today).days
-        if min_dte <= delta <= max_dte:
-            return day["date"]
-    return None
-
-
 def find_put_contract(puts: dict, target_strike: float) -> dict | None:
     """
     puts: {contract_symbol: snapshot}
@@ -82,7 +66,7 @@ def find_put_contract(puts: dict, target_strike: float) -> dict | None:
     candidates = []
     for contract, data in puts.items():
         try:
-            strike = int(contract[-8:]) / 1000
+            strike = parse_strike(contract)
         except Exception:
             continue
         bid = data.get("latestQuote", {}).get("bp", 0) or 0
@@ -136,7 +120,7 @@ def run(
         return None
 
     # Filter puts to target expiry
-    expiry_puts = {k: v for k, v in puts.items() if expiry.replace("-", "")[2:] in k}
+    expiry_puts = {k: v for k, v in puts.items() if _expiry_tag(expiry) in k}
     if not expiry_puts:
         expiry_puts = puts
 

@@ -12,6 +12,7 @@ MCP tools used: get_option_chain, get_calendar, place_option_order
 import json
 from datetime import date
 from pathlib import Path
+from occ import find_expiry, parse_strike, expiry_tag as _expiry_tag
 
 ROOT = Path(__file__).parent.parent
 STATE_FILE = ROOT / "wheel" / "state.json"
@@ -34,21 +35,6 @@ def append_log(entry: str):
         f.write(f"\n{entry}\n")
 
 
-def find_expiry(trading_days: list, min_dte: int = 21, max_dte: int = 45) -> str | None:
-    today = date.today()
-    for day in trading_days:
-        d = date.fromisoformat(day["date"])
-        delta = (d - today).days
-        if min_dte <= delta <= max_dte and d.weekday() == 4:
-            return day["date"]
-    for day in trading_days:
-        d = date.fromisoformat(day["date"])
-        delta = (d - today).days
-        if min_dte <= delta <= max_dte:
-            return day["date"]
-    return None
-
-
 def find_call_contract(calls: dict, target_strike: float, min_strike: float) -> dict | None:
     """
     calls: {contract_symbol: snapshot}
@@ -59,7 +45,7 @@ def find_call_contract(calls: dict, target_strike: float, min_strike: float) -> 
     candidates = []
     for contract, data in calls.items():
         try:
-            strike = int(contract[-8:]) / 1000
+            strike = parse_strike(contract)
         except Exception:
             continue
         if strike < min_strike:
@@ -136,7 +122,7 @@ def run(
     _check_dividend_risk(symbol, expiry)
 
     # Filter calls to target expiry
-    expiry_calls = {k: v for k, v in calls.items() if expiry.replace("-", "")[2:] in k}
+    expiry_calls = {k: v for k, v in calls.items() if _expiry_tag(expiry) in k}
     if not expiry_calls:
         expiry_calls = calls
 

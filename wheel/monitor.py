@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 import put_seller
 import call_seller
 import roller
+from occ import parse_strike
 from config import (
     PROFIT_CLOSE_PCT,
     FAST_PROFIT_CLOSE_PCT,
@@ -427,7 +428,7 @@ def run(
                     # Check for roll trigger: stock within ROLL_PUT_THRESH of strike
                     option_strike = sym_state.get("breakeven", 0) or 0
                     try:
-                        option_strike = int(option_sym[-8:]) / 1000
+                        option_strike = parse_strike(option_sym)
                     except Exception:
                         pass
 
@@ -573,7 +574,7 @@ def run(
                 else:
                     # Check for roll-up trigger: stock significantly above call strike
                     try:
-                        call_strike = int(option_sym[-8:]) / 1000
+                        call_strike = parse_strike(option_sym)
                     except Exception:
                         call_strike = 0
 

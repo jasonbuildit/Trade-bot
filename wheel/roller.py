@@ -14,32 +14,7 @@ Rolling rules:
 Called by: monitor.py when roll trigger conditions are met.
 MCP tools used (by Claude): place_option_order with order_class="mleg"
 """
-from datetime import date
-from pathlib import Path
-
-
-def _find_expiry(trading_days: list, min_dte: int = 21, max_dte: int = 45) -> str | None:
-    today = date.today()
-    for day in trading_days:
-        d = date.fromisoformat(day["date"])
-        delta = (d - today).days
-        if min_dte <= delta <= max_dte and d.weekday() == 4:
-            return day["date"]
-    for day in trading_days:
-        d = date.fromisoformat(day["date"])
-        delta = (d - today).days
-        if min_dte <= delta <= max_dte:
-            return day["date"]
-    return None
-
-
-def _parse_strike(contract: str) -> float:
-    return int(contract[-8:]) / 1000
-
-
-def _parse_expiry(contract: str, symbol: str) -> str:
-    exp = "20" + contract[len(symbol):len(symbol)+6]
-    return f"{exp[:4]}-{exp[4:6]}-{exp[6:8]}"
+from occ import find_expiry as _find_expiry, parse_strike as _parse_strike, parse_expiry as _parse_expiry, expiry_tag as _expiry_tag
 
 
 def roll_put_down_and_out(
@@ -70,7 +45,7 @@ def roll_put_down_and_out(
         print(f"[roller] {symbol}: no later expiry found in 21-45 DTE — cannot roll")
         return None
 
-    expiry_tag = new_expiry.replace("-", "")[2:]  # OCC uses YYMMDD, not YYYYMMDD
+    expiry_tag = _expiry_tag(new_expiry)
 
     # Candidate replacement contracts: same or lower strike, new expiry, valid bid
     candidates = []
@@ -167,7 +142,7 @@ def roll_call_up_and_out(
         print(f"[roller] {symbol}: no later expiry found in 21-45 DTE — cannot roll call")
         return None
 
-    expiry_tag = new_expiry.replace("-", "")[2:]  # OCC uses YYMMDD, not YYYYMMDD
+    expiry_tag = _expiry_tag(new_expiry)
 
     # Candidate replacement contracts: higher strike, above effective_basis, new expiry
     candidates = []
