@@ -4,8 +4,8 @@ Ranks watchlist candidates by annualized put premium yield and picks the best on
 
 Filters applied (in order):
   1. Earnings gate     — skip expiries that fall inside earnings window
-  2. Delta cap         — skip delta > 0.35 (too ATM) or < 0.05 (too OTM)
-  3. Bid-ask spread    — skip spread > 15% of mid (illiquid fill)
+  2. Delta cap         — skip delta > 0.35 (too ATM) or < 0.16 (too OTM)
+  3. Bid-ask spread    — skip spread > 10% of mid (illiquid fill)
   4. Stale OI proxy    — skip if zero volume and stale daily bar
   5. IV floor          — flag if ATM IV < 20% (low premium environment)
   6. Trend filter      — flag if price < SMA-21 (downtrend; auto-skip in strict mode)
@@ -18,10 +18,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
 
-DELTA_MIN = 0.05   # too far OTM below this
-DELTA_MAX = 0.35   # too close to ATM above this
-SPREAD_MAX = 0.15  # max bid-ask spread as % of mid
-IV_FLOOR = 0.20    # minimum ATM implied volatility (annualized)
+from config import DELTA_MIN, DELTA_MAX, SPREAD_MAX, IV_FLOOR
+from occ import parse_strike, parse_expiry
 
 
 def load_watchlist() -> list[dict]:
@@ -81,16 +79,13 @@ def score_candidate(
             skipped["no_bid"] += 1
             continue
 
-        # Parse strike from OCC symbol: last 8 chars = strike * 1000
         try:
-            strike = int(contract[-8:]) / 1000
+            strike = parse_strike(contract)
         except Exception:
             continue
 
-        # Parse expiry from OCC symbol: chars 6-13 = YYMMDD
         try:
-            exp_str = "20" + contract[len(symbol):len(symbol)+6]
-            expiry_date_str = f"{exp_str[:4]}-{exp_str[4:6]}-{exp_str[6:8]}"
+            expiry_date_str = parse_expiry(contract, symbol)
             days = dte(expiry_date_str)
         except Exception:
             days = None

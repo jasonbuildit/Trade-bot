@@ -12,23 +12,36 @@ MCP tools used:
   place_option_order
 """
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import put_seller
 import call_seller
 import roller
+from occ import parse_strike
+from config import (
+    PROFIT_CLOSE_PCT,
+    FAST_PROFIT_CLOSE_PCT,
+    LOSS_LIMIT_PCT,
+    ROLL_PUT_THRESH,
+    ROLL_CALL_THRESH,
+    DRAWDOWN_PAUSE,
+    DRAWDOWN_REDUCE,
+    DRAWDOWN_DISABLE,
+    MARKET_OPEN_BUFFER_MIN,
+    MARKET_CLOSE_BUFFER_MIN,
+    UNDERLYING_WARN_PCT,
+    UNDERLYING_BLOCK_PCT,
+    EARNINGS_PROXIMITY_DAYS,
+    ORDER_ADJUSTMENT_MAX,
+)
 
 ROOT = Path(__file__).parent.parent
 STATE_FILE = ROOT / "wheel" / "state.json"
 LOG_FILE = ROOT / "trades" / "wheel_log.md"
+WATCHLIST_FILE = ROOT / "wheel" / "watchlist.json"
 ET = ZoneInfo("America/New_York")
-
-PROFIT_CLOSE_PCT = 0.50   # close when unrealized_pl >= 50% of premium received
-LOSS_LIMIT_PCT   = 2.00   # close when unrealized loss >= 200% of premium received
-ROLL_PUT_THRESH  = 0.03   # roll put when stock is within 3% of strike (approaching ITM)
-ROLL_CALL_THRESH = 0.05   # roll call up when stock is 5%+ above call strike (deeply ITM call)
 
 
 def load_state() -> dict:
@@ -48,6 +61,198 @@ def append_log(entry: str):
 
 def positions_by_symbol(positions: list) -> dict:
     return {p["symbol"]: p for p in positions}
+
+
+def _load_watchlist_meta() -> dict:
+    """Returns {symbol: metadata_dict} for quick lookup."""
+    try:
+        with open(WATCHLIST_FILE) as f:
+            data = json.load(f)
+        return {s["symbol"]: s for s in data.get("symbols", []) if isinstance(s, dict)}
+    except Exception:
+        return {}
+
+
+def check_drawdown(account: dict, state: dict) -> float:
+    """
+    Computes portfolio drawdown from peak equity.
+    Updates peak_equity in state (caller must save state).
+    Returns drawdown as a fraction (0.10 = 10%).
+    """
+    equity = float(account.get("equity", 0))
+    peak = state["account_summary"].get("peak_equity") or equity  # None → use current equity
+    if equity > peak:
+        state["account_summary"]["peak_equity"] = equity
+        peak = equity
+    return (peak - equity) / peak if peak > 0 else 0.0
+
+
+def _strategy_mode(drawdown: float) -> str:
+    if drawdown >= DRAWDOWN_DISABLE:
+        return "disabled"
+    if drawdown >= DRAWDOWN_REDUCE:
+        return "reduce"
+    if drawdown >= DRAWDOWN_PAUSE:
+        return "pause"
+    return "active"
+
+
+def _in_trading_window(now_et: datetime) -> bool:
+    """True if current time is past the open buffer and before the close buffer."""
+    open_buffer  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0) + timedelta(minutes=MARKET_OPEN_BUFFER_MIN)
+    close_buffer = now_et.replace(hour=16, minute=0,  second=0, microsecond=0) - timedelta(minutes=MARKET_CLOSE_BUFFER_MIN)
+    return open_buffer <= now_et <= close_buffer
+
+
+def _reconcile_pending_fills(state: dict, pos_map: dict, open_option_map: dict) -> None:
+    """
+    Cross-references pending_fill orders against live positions and open orders.
+    - Option found in pos_map → order filled; record fill price.
+    - Option absent from both pos_map and open_option_map → expired/canceled; remove from state.
+    - Option in open_option_map but not yet in positions → still pending; leave unchanged.
+    open_option_map: {option_symbol: order_dict} for all open us_option orders.
+    Mutates state in place; caller must save.
+    """
+    open_option_syms = set(open_option_map.keys())
+    today_str = date.today().isoformat()
+
+    for symbol in list(state["symbols"].keys()):
+        sym_state = state["symbols"].get(symbol, {})
+        if sym_state.get("order_status") != "pending_fill":
+            continue
+        option_sym = sym_state.get("option_symbol")
+        if not option_sym:
+            continue
+
+        if option_sym in pos_map:
+            fill_price = float(pos_map[option_sym].get("avg_entry_price", 0))
+            state["symbols"][symbol]["order_status"] = "filled"
+            state["symbols"][symbol]["fill_price"] = fill_price
+            print(f"[monitor] {symbol}: fill confirmed — {option_sym} at avg ${fill_price:.2f}")
+            append_log(
+                f"## {today_str} — Fill Confirmed\n"
+                f"Symbol: {symbol} | Option: {option_sym} | Fill price: ${fill_price:.2f}"
+            )
+        elif option_sym not in open_option_syms:
+            print(
+                f"[monitor] {symbol}: order expired/canceled — {option_sym} not found in "
+                f"positions or open orders. Clearing state, ready for fresh screener run."
+            )
+            append_log(
+                f"## {today_str} — Order Expired/Canceled\n"
+                f"Symbol: {symbol} | Option: {option_sym} | "
+                f"Was pending_fill but not found in live positions or open orders. State cleared."
+            )
+            del state["symbols"][symbol]
+
+
+def _find_contract_bid(option_sym: str, option_chains: dict) -> float | None:
+    """Looks up current bid for a specific contract across all chains."""
+    for sym_chains in option_chains.values():
+        for side in ("puts", "calls"):
+            contracts = sym_chains.get(side, {})
+            if option_sym in contracts:
+                bid = contracts[option_sym].get("latestQuote", {}).get("bp", 0) or 0
+                return float(bid) if bid > 0 else None
+    return None
+
+
+def _adjust_pending_entries(
+    state: dict,
+    open_option_map: dict,
+    option_chains: dict,
+) -> list:
+    """
+    For pending_fill GTC entry orders still sitting in open_option_map:
+    - adjustment_count < ORDER_ADJUSTMENT_MAX: step limit toward current bid, emit replace_order_by_id.
+    - adjustment_count >= ORDER_ADJUSTMENT_MAX: emit cancel_order_by_id, clear state.
+    One adjustment per monitor cycle (15 min cadence).
+    Mutates adjustment_count in state; caller must save.
+    """
+    actions = []
+    for symbol in list(state["symbols"].keys()):
+        sym_state = state["symbols"].get(symbol, {})
+        if sym_state.get("order_status") != "pending_fill":
+            continue
+        option_sym = sym_state.get("option_symbol")
+        if not option_sym or option_sym not in open_option_map:
+            continue
+
+        order = open_option_map[option_sym]
+        order_id = order["id"]
+        adj_count = sym_state.get("adjustment_count", 0)
+
+        if adj_count >= ORDER_ADJUSTMENT_MAX:
+            print(
+                f"[monitor] {symbol}: {option_sym} — "
+                f"{ORDER_ADJUSTMENT_MAX} price adjustments exhausted, canceling GTC order"
+            )
+            del state["symbols"][symbol]
+            actions.append({
+                "symbol": symbol,
+                "action": "cancel_unfilled_entry",
+                "_mcp_call": "cancel_order_by_id",
+                "order_id": order_id,
+            })
+            continue
+
+        bid = _find_contract_bid(option_sym, option_chains)
+        if bid is None or bid <= 0:
+            print(f"[monitor] {symbol}: {option_sym} — no bid data, skipping price adjustment")
+            continue
+
+        current_limit = float(order.get("limit_price") or sym_state.get("premium_collected", 0))
+        if current_limit <= bid:
+            continue  # already at or below bid — nothing to do
+
+        steps_left = ORDER_ADJUSTMENT_MAX - adj_count
+        step = round((current_limit - bid) / steps_left, 2)
+        new_limit = round(max(bid, current_limit - step), 2)
+
+        if new_limit >= current_limit:
+            continue
+
+        print(
+            f"[monitor] {symbol}: adjusting {option_sym} limit "
+            f"${current_limit:.2f} -> ${new_limit:.2f} "
+            f"(bid ${bid:.2f}, adj #{adj_count + 1}/{ORDER_ADJUSTMENT_MAX})"
+        )
+        state["symbols"][symbol]["adjustment_count"] = adj_count + 1
+        actions.append({
+            "symbol": symbol,
+            "action": "adjust_entry_order",
+            "_mcp_call": "replace_order_by_id",
+            "order_id": order_id,
+            "limit_price": str(new_limit),
+        })
+
+    return actions
+
+
+def _can_redeploy(symbol: str, now_et: datetime, sym_meta: dict, drawdown: float) -> bool:
+    """Gates whether a new position can be opened after a profit close."""
+    if not _in_trading_window(now_et):
+        print(f"[monitor] {symbol}: redeployment blocked — outside trading window")
+        return False
+    earnings_date = sym_meta.get("earnings_date")
+    if earnings_date:
+        days_to_earnings = (date.fromisoformat(earnings_date) - date.today()).days
+        if 0 < days_to_earnings <= EARNINGS_PROXIMITY_DAYS:
+            print(f"[monitor] {symbol}: redeployment blocked — earnings in {days_to_earnings} days")
+            return False
+    if drawdown >= DRAWDOWN_PAUSE:
+        print(f"[monitor] {symbol}: redeployment blocked — portfolio drawdown {drawdown:.1%}")
+        return False
+    return True
+
+
+def is_fast_profit(position: dict) -> bool:
+    """Close early when 75%+ of max profit is reached — don't wait for pennies."""
+    cost_basis = float(position.get("cost_basis", 0))
+    unrealized_pl = float(position.get("unrealized_pl", 0))
+    if cost_basis >= 0:
+        return False
+    return unrealized_pl >= abs(cost_basis) * FAST_PROFIT_CLOSE_PCT
 
 
 def is_50pct_profit(position: dict) -> bool:
@@ -75,12 +280,26 @@ def is_loss_limit(position: dict) -> bool:
     return unrealized_pl <= cost_basis * LOSS_LIMIT_PCT
 
 
-def _close_order(option_sym: str) -> dict:
-    return {
+def _close_order(option_sym: str, limit_price: float | None = None) -> dict:
+    """
+    limit_price: use for profit closes (patient). Omit for loss-limit closes (urgent → market).
+    """
+    order: dict = {
         "_mcp_call": "place_option_order",
         "symbol": option_sym, "side": "buy", "qty": "1",
-        "position_intent": "buy_to_close", "type": "market",
+        "position_intent": "buy_to_close",
     }
+    if limit_price is not None and limit_price > 0:
+        order["type"] = "limit"
+        order["limit_price"] = str(round(limit_price, 2))
+    else:
+        order["type"] = "market"
+    return order
+
+
+def _mark_price(option_pos: dict) -> float:
+    """Current per-share mark of a short option from its position market_value."""
+    return abs(float(option_pos.get("market_value", 0))) / 100
 
 
 def run(
@@ -116,13 +335,55 @@ def run(
 
     state = load_state()
     pos_map = positions_by_symbol(positions)
+    open_option_map = {
+        o["symbol"]: o for o in open_orders
+        if o.get("asset_class") == "us_option"
+    }
+    _reconcile_pending_fills(state, pos_map, open_option_map)
+    save_state(state)
     buying_power = float(account.get("non_marginable_buying_power", 0))
     portfolio_value = float(account.get("portfolio_value", 0))
+    watchlist_meta = _load_watchlist_meta()
+
+    # ── Portfolio drawdown check ──────────────────────────────────────────────
+    drawdown = check_drawdown(account, state)
+    mode = _strategy_mode(drawdown)
+
+    if mode == "disabled":
+        print(
+            f"[monitor] STRATEGY DISABLED — portfolio drawdown {drawdown:.1%} "
+            f"exceeds {DRAWDOWN_DISABLE:.0%} threshold. Close/roll existing positions only."
+        )
+        append_log(
+            f"## {today} — STRATEGY DISABLED\n"
+            f"Portfolio drawdown {drawdown:.1%} >= {DRAWDOWN_DISABLE:.0%} threshold. "
+            f"No new premium selling until manually reviewed and re-enabled."
+        )
+        # Save updated peak_equity even in disabled mode
+        save_state(state)
+        return {"status": "strategy_disabled", "drawdown": drawdown, "actions": []}
+
+    if mode == "reduce":
+        print(f"[monitor] DRAWDOWN ALERT: {drawdown:.1%} >= {DRAWDOWN_REDUCE:.0%} — consider reducing position size")
+    elif mode == "pause":
+        print(f"[monitor] DRAWDOWN PAUSE: {drawdown:.1%} >= {DRAWDOWN_PAUSE:.0%} — new entries blocked")
+
+    save_state(state)  # persist updated peak_equity
+
+    in_window = _in_trading_window(now_et)
+
+    # ── Order execution ladder ────────────────────────────────────────────────
+    # Runs any time market is open — adjusting existing orders is not a new entry
+    ladder_actions = _adjust_pending_entries(state, open_option_map, option_chains)
+    if ladder_actions:
+        actions.extend(ladder_actions)
+        save_state(state)
 
     print(
         f"[monitor] {now_et.strftime('%Y-%m-%d %H:%M ET')} | "
         f"{len(state['symbols'])} tracked symbols | "
-        f"buying power ${buying_power:,.0f}"
+        f"buying power ${buying_power:,.0f} | "
+        f"drawdown {drawdown:.1%} | mode {mode} | window {'OPEN' if in_window else 'BUFFER'}"
     )
 
     # ── Per-symbol checks ─────────────────────────────────────────────────────
@@ -138,29 +399,64 @@ def run(
             snap.get("latestQuote", {}).get("ap", 0)
         )
 
+        sym_meta = watchlist_meta.get(symbol, {})
+
         # ── Stage 1: short put ─────────────────────────────────────────────
         if stage == 1:
-            if option_pos is None and share_pos is not None:
-                # ASSIGNED — put was exercised, we now own shares
+            # Underlying price health check vs put entry
+            entry_price = sym_state.get("entry_price")
+            if entry_price and current_price > 0:
+                price_chg = (current_price - entry_price) / entry_price
+                if price_chg <= -UNDERLYING_BLOCK_PCT:
+                    print(
+                        f"[monitor] {symbol}: ALERT — stock ${current_price:.2f} is "
+                        f"{abs(price_chg):.1%} below put entry ${entry_price:.2f} — "
+                        f"no new puts on this symbol"
+                    )
+                elif price_chg <= -UNDERLYING_WARN_PCT:
+                    print(
+                        f"[monitor] {symbol}: WARNING — stock ${current_price:.2f} is "
+                        f"{abs(price_chg):.1%} below put entry ${entry_price:.2f} — monitoring"
+                    )
+
+            underlying_blocked = (
+                entry_price and current_price > 0 and
+                (current_price - entry_price) / entry_price <= -UNDERLYING_BLOCK_PCT
+            )
+
+            if option_pos is None and share_pos is not None and float(share_pos.get("qty", 0)) >= 100:
+                # ASSIGNED — put was exercised, we now own ≥100 shares
                 cost_basis = float(share_pos["avg_entry_price"])
                 premiums = sym_state.get("total_premium_all_cycles", 0)
                 print(f"[monitor] {symbol}: ASSIGNED at ${cost_basis:.2f} — moving to Stage 2")
 
                 calls = option_chains.get(symbol, {}).get("calls", {})
-                result = call_seller.run(
-                    symbol, cost_basis, premiums, calls, trading_days, dry_run=dry_run
-                )
+                result = None
+                if in_window and mode != "pause":
+                    result = call_seller.run(
+                        symbol, cost_basis, premiums, calls, trading_days, dry_run=dry_run
+                    )
+                else:
+                    print(f"[monitor] {symbol}: assignment detected but new call blocked (mode={mode}, window={in_window})")
                 actions.append({"symbol": symbol, "action": "assigned_to_stage2", "order": result})
 
             elif option_pos is None:
-                # Put expired worthless — sell a new one
-                print(f"[monitor] {symbol}: put expired worthless — selling new put")
-                puts = option_chains.get(symbol, {}).get("puts", {})
-                result = put_seller.run(
-                    symbol, current_price, buying_power, puts, trading_days,
-                    portfolio_value=portfolio_value, dry_run=dry_run,
-                )
-                actions.append({"symbol": symbol, "action": "put_expired_resell", "order": result})
+                if sym_state.get("order_status") == "pending_fill":
+                    # GTC order still open in broker — ladder handles price; nothing else to do
+                    print(f"[monitor] {symbol}: GTC entry order pending fill — waiting")
+                    continue
+                # Put expired worthless — sell a new one if conditions allow
+                print(f"[monitor] {symbol}: put expired worthless")
+                if mode == "pause" or not in_window or underlying_blocked:
+                    reason = "drawdown pause" if mode == "pause" else ("outside window" if not in_window else "underlying blocked")
+                    print(f"[monitor] {symbol}: skipping new put — {reason}")
+                else:
+                    puts = option_chains.get(symbol, {}).get("puts", {})
+                    result = put_seller.run(
+                        symbol, current_price, buying_power, puts, trading_days,
+                        portfolio_value=portfolio_value, dry_run=dry_run,
+                    )
+                    actions.append({"symbol": symbol, "action": "put_expired_resell", "order": result})
 
             elif option_pos:
                 pl = float(option_pos["unrealized_pl"])
@@ -171,7 +467,7 @@ def run(
                         f"[monitor] {symbol}: LOSS LIMIT triggered on {option_sym} | "
                         f"P/L ${pl:.2f} — closing immediately, NO auto-resell"
                     )
-                    close_order = _close_order(option_sym)
+                    close_order = _close_order(option_sym)  # market — urgency over price
                     if not dry_run:
                         append_log(
                             f"## {today} — LOSS LIMIT (Stage 1)\n"
@@ -183,20 +479,43 @@ def run(
                         "close_order": close_order,
                     })
 
+                # 75% fast profit rule (check before 50%)
+                elif is_fast_profit(option_pos):
+                    print(f"[monitor] {symbol}: 75% FAST PROFIT on {option_sym} | P/L ${pl:.2f}")
+                    close_order = _close_order(option_sym, limit_price=_mark_price(option_pos))
+                    if not dry_run:
+                        append_log(
+                            f"## {today} — 75% Fast Profit Close (Stage 1)\n"
+                            f"Symbol: {symbol} | Closed put: {option_sym} | P/L: ${pl:.2f}"
+                        )
+                    new_put = None
+                    if _can_redeploy(symbol, now_et, sym_meta, drawdown) and not underlying_blocked:
+                        puts = option_chains.get(symbol, {}).get("puts", {})
+                        new_put = put_seller.run(
+                            symbol, current_price, buying_power, puts, trading_days,
+                            portfolio_value=portfolio_value, dry_run=dry_run,
+                        )
+                    actions.append({
+                        "symbol": symbol, "action": "fast_profit_close_put",
+                        "close_order": close_order, "new_order": new_put,
+                    })
+
                 # 50% profit rule
                 elif is_50pct_profit(option_pos):
                     print(f"[monitor] {symbol}: 50% profit rule triggered on {option_sym}")
-                    close_order = _close_order(option_sym)
+                    close_order = _close_order(option_sym, limit_price=_mark_price(option_pos))
                     if not dry_run:
                         append_log(
                             f"## {today} — 50% Profit Close (Stage 1)\n"
                             f"Symbol: {symbol} | Closed put: {option_sym} | P/L: ${pl:.2f}"
                         )
-                    puts = option_chains.get(symbol, {}).get("puts", {})
-                    new_put = put_seller.run(
-                        symbol, current_price, buying_power, puts, trading_days,
-                        portfolio_value=portfolio_value, dry_run=dry_run,
-                    )
+                    new_put = None
+                    if _can_redeploy(symbol, now_et, sym_meta, drawdown) and not underlying_blocked:
+                        puts = option_chains.get(symbol, {}).get("puts", {})
+                        new_put = put_seller.run(
+                            symbol, current_price, buying_power, puts, trading_days,
+                            portfolio_value=portfolio_value, dry_run=dry_run,
+                        )
                     actions.append({
                         "symbol": symbol, "action": "50pct_close_put",
                         "close_order": close_order, "new_order": new_put,
@@ -206,7 +525,7 @@ def run(
                     # Check for roll trigger: stock within ROLL_PUT_THRESH of strike
                     option_strike = sym_state.get("breakeven", 0) or 0
                     try:
-                        option_strike = int(option_sym[-8:]) / 1000
+                        option_strike = parse_strike(option_sym)
                     except Exception:
                         pass
 
@@ -217,8 +536,7 @@ def run(
                             f"price ${current_price:.2f} within {ROLL_PUT_THRESH*100:.0f}% of "
                             f"strike ${option_strike:.0f}"
                         )
-                        # Current ask on put = cost to close (use mid as proxy)
-                        current_ask = abs(float(option_pos.get("cost_basis", 0))) / 100
+                        current_ask = _mark_price(option_pos)  # current option value from market_value
                         puts = option_chains.get(symbol, {}).get("puts", {})
                         roll = roller.roll_put_down_and_out(
                             symbol, option_sym, current_ask, puts, trading_days
@@ -243,9 +561,20 @@ def run(
 
         # ── Stage 2: short call ────────────────────────────────────────────
         elif stage == 2:
+            cost_basis_stage2 = sym_state.get("cost_basis", 0) or 0
+
+            # Underlying health check vs assigned cost basis
+            if cost_basis_stage2 > 0 and current_price > 0:
+                stock_chg = (current_price - cost_basis_stage2) / cost_basis_stage2
+                if stock_chg <= -UNDERLYING_BLOCK_PCT:
+                    print(
+                        f"[monitor] {symbol}: ALERT — assigned stock ${current_price:.2f} is "
+                        f"{abs(stock_chg):.1%} below cost basis ${cost_basis_stage2:.2f} — "
+                        f"no new puts on this symbol after call closes"
+                    )
+
             if option_pos is None and share_pos is None:
                 # CALLED AWAY — shares sold, back to Stage 1
-                cost_basis = sym_state.get("cost_basis", 0) or 0
                 total_premium = sym_state.get("total_premium_all_cycles", 0)
                 cycle_number = sym_state.get("cycle_number", 1)
                 cycle_pl = total_premium * 100  # premium is per-share, × 100 for contract
@@ -256,23 +585,30 @@ def run(
                 state["symbols"][symbol]["shares_qty"] = 0
                 save_state(state)
 
-                puts = option_chains.get(symbol, {}).get("puts", {})
-                result = put_seller.run(
-                    symbol, current_price, buying_power, puts, trading_days,
-                    portfolio_value=portfolio_value, dry_run=dry_run,
-                )
-                actions.append({"symbol": symbol, "action": "called_away_to_stage1", "order": result})
+                new_put = None
+                if in_window and mode != "pause" and _can_redeploy(symbol, now_et, sym_meta, drawdown):
+                    puts = option_chains.get(symbol, {}).get("puts", {})
+                    new_put = put_seller.run(
+                        symbol, current_price, buying_power, puts, trading_days,
+                        portfolio_value=portfolio_value, dry_run=dry_run,
+                    )
+                else:
+                    print(f"[monitor] {symbol}: called away — new put blocked (mode={mode}, window={in_window})")
+
+                actions.append({"symbol": symbol, "action": "called_away_to_stage1", "order": new_put})
 
                 if not dry_run:
                     append_log(
                         f"## {today} — Cycle Complete: {symbol} Cycle #{cycle_number}\n"
-                        f"Called away | Cost basis: ${cost_basis:.2f} | "
+                        f"Called away | Cost basis: ${cost_basis_stage2:.2f} | "
                         f"Total premium collected: ${total_premium:.2f} | "
                         f"Cycle premium P/L: +${cycle_pl:.2f}"
                     )
 
             elif option_pos:
                 pl = float(option_pos["unrealized_pl"])
+                cost_basis_call = sym_state.get("cost_basis", 0)
+                premiums = sym_state.get("total_premium_all_cycles", 0)
 
                 # Loss limit on covered call
                 if is_loss_limit(option_pos):
@@ -280,7 +616,7 @@ def run(
                         f"[monitor] {symbol}: LOSS LIMIT triggered on call {option_sym} | "
                         f"P/L ${pl:.2f} — closing call, holding shares"
                     )
-                    close_order = _close_order(option_sym)
+                    close_order = _close_order(option_sym)  # market — urgency over price
                     if not dry_run:
                         append_log(
                             f"## {today} — LOSS LIMIT (Stage 2 Call)\n"
@@ -292,21 +628,41 @@ def run(
                         "close_order": close_order,
                     })
 
+                # 75% fast profit on covered call
+                elif is_fast_profit(option_pos):
+                    print(f"[monitor] {symbol}: 75% FAST PROFIT on call {option_sym} | P/L ${pl:.2f}")
+                    close_order = _close_order(option_sym, limit_price=_mark_price(option_pos))
+                    if not dry_run:
+                        append_log(
+                            f"## {today} — 75% Fast Profit Close (Stage 2)\n"
+                            f"Symbol: {symbol} | Closed call: {option_sym} | P/L: ${pl:.2f}"
+                        )
+                    new_call = None
+                    if _can_redeploy(symbol, now_et, sym_meta, drawdown):
+                        calls = option_chains.get(symbol, {}).get("calls", {})
+                        new_call = call_seller.run(
+                            symbol, cost_basis_call, premiums, calls, trading_days, dry_run=dry_run
+                        )
+                    actions.append({
+                        "symbol": symbol, "action": "fast_profit_close_call",
+                        "close_order": close_order, "new_order": new_call,
+                    })
+
                 # 50% profit on covered call
                 elif is_50pct_profit(option_pos):
                     print(f"[monitor] {symbol}: 50% profit rule triggered on call {option_sym}")
-                    cost_basis = sym_state.get("cost_basis", 0)
-                    premiums = sym_state.get("total_premium_all_cycles", 0)
-                    close_order = _close_order(option_sym)
+                    close_order = _close_order(option_sym, limit_price=_mark_price(option_pos))
                     if not dry_run:
                         append_log(
                             f"## {today} — 50% Profit Close (Stage 2)\n"
                             f"Symbol: {symbol} | Closed call: {option_sym} | P/L: ${pl:.2f}"
                         )
-                    calls = option_chains.get(symbol, {}).get("calls", {})
-                    new_call = call_seller.run(
-                        symbol, cost_basis, premiums, calls, trading_days, dry_run=dry_run
-                    )
+                    new_call = None
+                    if _can_redeploy(symbol, now_et, sym_meta, drawdown):
+                        calls = option_chains.get(symbol, {}).get("calls", {})
+                        new_call = call_seller.run(
+                            symbol, cost_basis_call, premiums, calls, trading_days, dry_run=dry_run
+                        )
                     actions.append({
                         "symbol": symbol, "action": "50pct_close_call",
                         "close_order": close_order, "new_order": new_call,
@@ -315,7 +671,7 @@ def run(
                 else:
                     # Check for roll-up trigger: stock significantly above call strike
                     try:
-                        call_strike = int(option_sym[-8:]) / 1000
+                        call_strike = parse_strike(option_sym)
                     except Exception:
                         call_strike = 0
 
@@ -328,7 +684,7 @@ def run(
                         cost_basis = sym_state.get("cost_basis", 0) or 0
                         premiums = sym_state.get("total_premium_all_cycles", 0)
                         effective_basis = cost_basis - premiums
-                        current_ask = abs(float(option_pos.get("cost_basis", 0))) / 100
+                        current_ask = _mark_price(option_pos)  # current option value from market_value
                         calls = option_chains.get(symbol, {}).get("calls", {})
                         roll = roller.roll_call_up_and_out(
                             symbol, option_sym, current_ask, calls,
@@ -352,20 +708,33 @@ def run(
                     else:
                         print(f"[monitor] {symbol}: Stage 2 holding | P/L ${pl:.2f}")
 
-    # ── Daily summary (run at 15:55 ET) ───────────────────────────────────────
-    if now_et.hour == 15 and now_et.minute >= 55:
+    # ── Daily summary (run in final 15 min of trading day) ───────────────────
+    close_summary_dt = now_et.replace(hour=15, minute=45, second=0, microsecond=0)
+    if now_et >= close_summary_dt:
         last_summary = state["account_summary"].get("last_daily_summary")
         if last_summary != today:
-            _write_daily_summary(state, pos_map, account, today)
+            summary_text = _write_daily_summary(state, pos_map, account, today)
             state["account_summary"]["last_daily_summary"] = today
             save_state(state)
+            actions.append({
+                "action": "daily_summary_email",
+                "_mcp_call": "create_gmail_draft",
+                "to": "jasonbuildit@gmail.com",
+                "subject": f"Flywheel Daily Summary {today}",
+                "body": summary_text,
+            })
 
     return {"status": "ok", "actions": actions}
 
 
-def _write_daily_summary(state: dict, pos_map: dict, account: dict, today: str):
+def _write_daily_summary(state: dict, pos_map: dict, account: dict, today: str) -> str:
     portfolio_value = float(account.get("portfolio_value", 0))
     total_premium = state["account_summary"].get("total_premium_collected", 0)
+
+    # Drawdown
+    peak_equity = state["account_summary"].get("peak_equity") or portfolio_value
+    drawdown = (peak_equity - portfolio_value) / peak_equity if peak_equity > 0 else 0.0
+    mode = _strategy_mode(drawdown)
 
     # Risk metrics
     total_max_risk = sum(
@@ -377,8 +746,13 @@ def _write_daily_summary(state: dict, pos_map: dict, account: dict, today: str):
 
     open_count = len(state["symbols"])
 
-    lines = [f"## {today} 15:55 ET — Daily Summary"]
-    lines.append(f"Portfolio: ${portfolio_value:,.2f} | Premium collected (all time): ${total_premium:.2f}")
+    now_str = datetime.now(ET).strftime("%H:%M")
+    lines = [f"## {today} {now_str} ET — Daily Summary"]
+    lines.append(
+        f"Portfolio: ${portfolio_value:,.2f} | Peak: ${peak_equity:,.2f} | "
+        f"Drawdown: {drawdown:.1%} | Mode: {mode.upper()}"
+    )
+    lines.append(f"Premium collected (all time): ${total_premium:.2f}")
     lines.append(
         f"Capital at risk (puts): ${total_max_risk:,.0f} | "
         f"BP utilization: {bp_utilization:.1f}% | "
@@ -395,15 +769,19 @@ def _write_daily_summary(state: dict, pos_map: dict, account: dict, today: str):
         roll_count = sym_state.get("roll_count", 0)
         pos = pos_map.get(option_sym)
         pl_str = f"${float(pos['unrealized_pl']):.2f}" if pos else "n/a"
+        entry_price = sym_state.get("entry_price")
+        cost_basis = sym_state.get("cost_basis")
+        ref_price = cost_basis if stage == 2 and cost_basis else entry_price
         lines.append(
             f"  {symbol}: {stage_label} | Option: {option_sym} | Expiry: {expiry} | "
             f"Premium: ${premium_cycle:.2f} | P/L: {pl_str} | Rolls: {roll_count}"
+            + (f" | Entry: ${ref_price:.2f}" if ref_price else "")
         )
 
     summary = "\n".join(lines)
     print(f"\n{'='*60}\n{summary}\n{'='*60}")
-    with open(LOG_FILE, "a") as f:
-        f.write(f"\n{summary}\n")
+    append_log(summary)
+    return summary
 
 
 if __name__ == "__main__":

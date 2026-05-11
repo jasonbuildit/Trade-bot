@@ -11,7 +11,11 @@
       "mcp__alpaca__get_option_chain",
       "mcp__alpaca__get_stock_snapshot",
       "WebSearch",
-      "mcp__alpaca__get_calendar"
+      "mcp__alpaca__get_calendar",
+      "Bash(New-Item -ItemType Directory -Path \"C:\\\\workspace\\\\Trade-bot\\\\wheel\\\\tests\" -Force)",
+      "Bash(Out-Null)",
+      "PowerShell(tail *)",
+      "Bash(C:\\\\workspace\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests/ -v)"
     ]
   }
 }

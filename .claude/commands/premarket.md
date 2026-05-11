@@ -13,26 +13,26 @@ Search: "US stock market open today $CURRENT_DATE holidays"
 
 ---
 
-## Step 2 — Watchlist News (Wheel Candidates)
+## Step 2 — Watchlist News (Active Wheel Candidates)
 
-For each symbol: **AAPL, KO, QQQ, ECC, APLE**
+For each enabled symbol: **AAPL, QQQ**
 Search: "[SYMBOL] stock news premarket today"
 
 Flag anything that could affect wheel decisions:
 - Earnings reports or guidance
 - Analyst upgrades/downgrades
-- Dividend changes (critical for KO, ECC, APLE)
+- Dividend changes (check ex_dividend_date in watchlist.json)
 - Product launches, legal events, macro sector moves
 - Large premarket price moves (>2%)
 
 ---
 
-## Step 3 — Active Positions
+## Step 3 — Open Positions Check
 
-Search news for: **GDX, gold miners, gold price**
-- Is gold/GDX trending up or down premarket?
-- Any major catalyst (Fed speakers, geopolitical, dollar moves)?
-- This matters for the open GDX $95/$100 bull call spread
+Read `wheel/state.json` and `trades/trades_log.md` to identify any open non-wheel positions (stocks, spreads, etc.).
+Search news for each open position symbol found.
+- Are any open positions near a key level or event?
+- Any catalyst that changes the risk profile?
 
 ---
 
@@ -61,7 +61,7 @@ Key events to flag:
 
 Search: "premarket futures today [DATE]" and "S&P 500 futures premarket"
 - Are futures up or down? By how much?
-- VIX level — elevated (>20) means caution on selling new puts
+- VIX level — elevated (>20) means caution on new puts; above 30 = hold
 - Any overnight news driving big moves
 
 ---
@@ -91,13 +91,12 @@ RECOMMENDATION: PROCEED / CAUTION / HOLD
 
 ── WATCHLIST ──────────────────────────────────
 AAPL:  [news summary, premarket move if any]
-KO:    [news summary]
 QQQ:   [news summary]
-ECC:   [news summary]
-APLE:  [news summary]
 
-── ACTIVE POSITIONS ───────────────────────────
-GDX:   [gold/miner news, spread impact]
+── OPEN POSITIONS ─────────────────────────────
+[List any open non-wheel positions from state.json / trades_log.md]
+[e.g. "GDX bull call spread $95/$105 Oct 16 — gold up/down X%"]
+[If none: "No additional open positions"]
 
 ── EARNINGS TODAY ─────────────────────────────
 [List of notable earnings, flag if affects QQQ]
