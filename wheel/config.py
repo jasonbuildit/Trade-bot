@@ -18,7 +18,7 @@ MAX_BP_COMMITTED    = 0.50   # max 50% of portfolio value in total open puts
 MIN_CASH_RESERVE_PCT = 0.25  # always keep 25% of portfolio value in cash
 
 # ── Per-position size cap ────────────────────────────────────────────────────
-DEFAULT_MAX_POSITION_PCT = 0.10  # 10% of portfolio per individual position
+DEFAULT_MAX_POSITION_PCT = 0.30  # 30% of portfolio per individual position
 
 # ── Profit / loss thresholds ─────────────────────────────────────────────────
 PROFIT_CLOSE_PCT      = 0.50  # close short option at 50% of max profit
@@ -46,7 +46,7 @@ UNDERLYING_BLOCK_PCT = 0.15  # block new puts if stock/assigned shares down 15%
 EARNINGS_PROXIMITY_DAYS = 14  # block redeployment if earnings within 14 days
 
 # ── Sector exposure cap ──────────────────────────────────────────────────────
-MAX_SECTOR_EXPOSURE = 0.25  # max 25% of portfolio in puts on correlated names (same sector)
+MAX_SECTOR_EXPOSURE = 0.30  # max 30% of portfolio in puts on correlated names (same sector)
 
 # ── Order execution ladder ───────────────────────────────────────────────────
 ORDER_ADJUSTMENT_MAX = 3  # max price adjustments per entry order (one per monitor cycle)
