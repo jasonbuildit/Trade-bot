@@ -97,7 +97,7 @@ def score_candidate(
 
         # ── Filter 2: Delta cap ──────────────────────────────────────────────
         delta = abs(data.get("greeks", {}).get("delta", 0) or 0)
-        if delta > DELTA_MAX or (delta > 0 and delta < DELTA_MIN):
+        if delta == 0 or delta > DELTA_MAX or delta < DELTA_MIN:
             skipped["delta"] += 1
             continue
 

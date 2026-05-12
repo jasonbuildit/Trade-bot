@@ -81,13 +81,11 @@ class TestDeltaFilter:
         results = screener.score_candidate(TICKER, 280.0, {sym: data})
         assert results == []
 
-    def test_delta_zero_not_filtered(self):
-        # delta=0 (no greek data) passes the delta filter — screener requires delta>0 AND <DELTA_MIN to block
+    def test_delta_zero_blocked(self):
+        # delta=0 means no greeks data (e.g. deep ITM); must be rejected
         sym, data = _contract(260, delta=0.0)
         results = screener.score_candidate(TICKER, 280.0, {sym: data})
-        # Not blocked by delta (no greeks present); may be blocked by other filters — just confirm delta isn't reason
-        # The screener lets it through; downstream callers can validate greeks separately
-        assert isinstance(results, list)
+        assert results == []
 
     def test_delta_in_range_passes(self):
         sym, data = _contract(260, delta=-0.25)
