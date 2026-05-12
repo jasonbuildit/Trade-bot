@@ -15,7 +15,11 @@
       "Bash(New-Item -ItemType Directory -Path \"C:\\\\workspace\\\\Trade-bot\\\\wheel\\\\tests\" -Force)",
       "Bash(Out-Null)",
       "PowerShell(tail *)",
-      "Bash(C:\\\\workspace\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests/ -v)"
+      "Bash(C:\\\\workspace\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests/ -v)",
+      "Skill(schedule)",
+      "mcp__alpaca__get_stock_bars",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; cd C:\\\\workspace\\\\Trade-bot\\\\wheel && C:\\\\workspace\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests/ -v 2>&1)",
+      "mcp__alpaca__get_option_snapshot"
     ]
   }
 }
