@@ -6,6 +6,9 @@
       "sector": "tech",
       "earnings_date": "2026-07-29",
       "ex_dividend_date": "2026-08-08",
+      "strategies": ["wheel", "put_spread"],
+      "allow_div_risk": false,
+      "iron_condor_eligible": false,
       "notes": "Primary wheel candidate — liquid options, high IV. Quarterly dividend ~$0.25."
     },
     {
@@ -14,6 +17,9 @@
       "sector": "consumer",
       "earnings_date": "2026-07-22",
       "ex_dividend_date": "2026-06-13",
+      "strategies": ["wheel"],
+      "allow_div_risk": false,
+      "iron_condor_eligible": false,
       "notes": "Options illiquid — bid=0 at most strikes, skip. Quarterly dividend payer."
     },
     {
@@ -22,7 +28,10 @@
       "sector": "etf",
       "earnings_date": null,
       "max_position_pct": 0.07,
-      "notes": "Index ETF — no earnings risk; override position cap to 7% (high strike price)"
+      "strategies": ["wheel", "put_spread", "iron_condor"],
+      "allow_div_risk": false,
+      "iron_condor_eligible": true,
+      "notes": "Index ETF — no earnings risk; override position cap to 7% (high strike price). Condor eligible."
     },
     {
       "symbol": "ECC",

@@ -143,3 +143,124 @@ class TestSorting:
         sym2, d2 = _contract(200, bid=2.00, ask=2.20)  # same bid, higher notional → lower yield
         results = screener.score_candidate(TICKER, 280.0, {sym1: d1, sym2: d2})
         assert results[0]["ann_yield"] >= results[-1]["ann_yield"]
+
+
+# ── Theta scoring ─────────────────────────────────────────────────────────────
+
+def _contract_with_theta(strike, theta=-0.05, **kwargs):
+    sym, data = _contract(strike, **kwargs)
+    data.setdefault("greeks", {})["theta"] = theta
+    return sym, data
+
+
+class TestTheta:
+    def test_theta_yield_present_in_result(self):
+        sym, data = _contract_with_theta(260)
+        results = screener.score_candidate(TICKER, 280.0, {sym: data})
+        assert len(results) == 1
+        assert "theta_yield" in results[0]
+        assert "theta" in results[0]
+
+    def test_theta_yield_nonzero_when_theta_provided(self):
+        sym, data = _contract_with_theta(260, theta=-0.05)
+        results = screener.score_candidate(TICKER, 280.0, {sym: data})
+        assert results[0]["theta_yield"] > 0
+
+    def test_theta_yield_zero_when_no_theta_in_greeks(self):
+        sym, data = _contract(260)
+        # Keep delta (needed to pass filter) but remove theta
+        data["greeks"].pop("theta", None)
+        results = screener.score_candidate(TICKER, 280.0, {sym: data})
+        assert len(results) == 1
+        assert results[0]["theta_yield"] == 0.0
+
+    def test_higher_theta_gives_higher_theta_yield(self):
+        sym1, d1 = _contract_with_theta(260, theta=-0.10)
+        sym2, d2 = _contract_with_theta(260, theta=-0.05)
+        r1 = screener.score_candidate(TICKER, 280.0, {sym1: d1})[0]
+        r2 = screener.score_candidate(TICKER, 280.0, {sym2: d2})[0]
+        assert r1["theta_yield"] > r2["theta_yield"]
+
+    def test_iv_rank_and_regime_present_when_vol_cache_provided(self):
+        sym, data = _contract_with_theta(260)
+        vol_cache = {
+            "date": date.today().isoformat(),
+            "symbols": {TICKER: {"iv_rank": 0.65, "regime": "high"}},
+        }
+        results = screener.score_candidate(TICKER, 280.0, {sym: data}, vol_cache=vol_cache)
+        assert results[0]["iv_rank"] == pytest.approx(0.65)
+        assert results[0]["regime"] == "high"
+
+    def test_iv_rank_none_when_no_vol_cache(self):
+        sym, data = _contract(260)
+        results = screener.score_candidate(TICKER, 280.0, {sym: data})
+        assert results[0]["iv_rank"] is None
+        assert results[0]["regime"] is None
+
+
+# ── IV regime gate ────────────────────────────────────────────────────────────
+
+def _make_vol_cache(symbol: str, regime: str, iv_rank: float = 0.5) -> dict:
+    return {
+        "date": date.today().isoformat(),
+        "symbols": {symbol: {"iv_rank": iv_rank, "regime": regime}},
+    }
+
+
+class TestVolRegimeGate:
+    def test_low_regime_blocked_in_strict_mode(self):
+        sym, data = _contract(260)
+        vol_cache = _make_vol_cache(TICKER, "low", iv_rank=0.20)
+        results = screener.score_candidate(
+            TICKER, 280.0, {sym: data}, strict_trend=True, vol_cache=vol_cache
+        )
+        assert results == []
+
+    def test_panic_regime_blocked_in_strict_mode(self):
+        sym, data = _contract(260)
+        vol_cache = _make_vol_cache(TICKER, "panic", iv_rank=0.90)
+        results = screener.score_candidate(
+            TICKER, 280.0, {sym: data}, strict_trend=True, vol_cache=vol_cache
+        )
+        assert results == []
+
+    def test_iv_regime_block_flag_set_for_low_regime(self):
+        sym, data = _contract(260)
+        vol_cache = _make_vol_cache(TICKER, "low", iv_rank=0.20)
+        results = screener.score_candidate(
+            TICKER, 280.0, {sym: data}, strict_trend=False, vol_cache=vol_cache
+        )
+        assert len(results) == 1
+        assert "IV_REGIME_BLOCK" in results[0]["flags"]
+
+    def test_iv_regime_block_flag_set_for_panic_regime(self):
+        sym, data = _contract(260)
+        vol_cache = _make_vol_cache(TICKER, "panic", iv_rank=0.90)
+        results = screener.score_candidate(
+            TICKER, 280.0, {sym: data}, strict_trend=False, vol_cache=vol_cache
+        )
+        assert len(results) == 1
+        assert "IV_REGIME_BLOCK" in results[0]["flags"]
+
+    def test_normal_regime_passes_in_strict_mode(self):
+        sym, data = _contract(260)
+        vol_cache = _make_vol_cache(TICKER, "normal", iv_rank=0.45)
+        results = screener.score_candidate(
+            TICKER, 280.0, {sym: data}, strict_trend=True, vol_cache=vol_cache
+        )
+        assert len(results) == 1
+
+    def test_high_regime_passes_in_strict_mode(self):
+        sym, data = _contract(260)
+        vol_cache = _make_vol_cache(TICKER, "high", iv_rank=0.70)
+        results = screener.score_candidate(
+            TICKER, 280.0, {sym: data}, strict_trend=True, vol_cache=vol_cache
+        )
+        assert len(results) == 1
+
+    def test_no_vol_cache_passes_all(self):
+        sym, data = _contract(260)
+        results = screener.score_candidate(
+            TICKER, 280.0, {sym: data}, strict_trend=True, vol_cache=None
+        )
+        assert len(results) == 1

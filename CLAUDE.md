@@ -8,6 +8,52 @@ Trade-bot is an automated options-income system running a **flywheel wheel strat
 
 The full strategy specification lives in `flywheel_options_strategy.md`. The shorter quick-reference rules are in `flywheel.md`. When they differ, `flywheel_options_strategy.md` is authoritative.
 
+## Testing and Diagnostics
+
+All commands run from `C:\workspace\Trade-bot\wheel\` so that relative imports resolve.
+
+```powershell
+# Unit tests (all)
+cd C:\workspace\Trade-bot\wheel
+python -m pytest tests/ -v
+
+# Single test file
+python -m pytest tests/test_monitor.py -v
+
+# Single test
+python -m pytest tests/test_screener.py::TestDeltaFilter::test_delta_zero_blocked -v
+
+# Smoke tests — full monitor.run() path scenarios with dry_run=True
+python smoke_test.py
+
+# State integrity check — run before market open or after any manual state edit
+python check_state.py
+```
+
+`conftest.py` inserts `wheel/` and `wheel/tests/` into `sys.path`. `tests/fixtures.py` provides shared test data (tickers, OCC symbols, position/account/clock dicts, `make_state()`).
+
+## Module Architecture
+
+```
+wheel/
+  config.py            — all strategy constants (single source of truth)
+  occ.py               — OCC symbol utilities: parse_strike, parse_expiry, find_expiry, expiry_tag
+  screener.py          — ranks watchlist puts by annualized yield; returns best candidate
+  volatility.py        — HV/IV rank computation; builds volatility_cache.json for entry gating
+  put_seller.py        — Tier 1: selects contract, enforces capital guards, emits _mcp_call
+  put_spread_seller.py — Tier 2: put credit spread entry; defined-risk CSP alternative
+  iron_condor.py       — Tier 3: iron condor entry for ETF-eligible symbols
+  call_seller.py       — Stage 2 (wheel): covered call above effective basis, emits _mcp_call
+  roller.py            — roll_put_down_and_out / roll_call_up_and_out; returns mleg _mcp_call
+  monitor.py           — orchestrator: profit closes, loss limits, assignments, rolls, daily summary
+  spread_monitor.py    — Tier 2: monitors open put spreads (profit/loss/expiry/gamma)
+  condor_monitor.py    — Tier 3: monitors open condors (profit/loss/expiry/untested-side roll)
+  check_state.py       — validates state.json integrity (no live calls needed)
+  smoke_test.py        — 16 end-to-end scenarios using mocked I/O
+```
+
+Data flow: Claude fetches all MCP data → passes to `monitor.run()` → monitor calls put_seller/call_seller/roller as needed → returns `actions` list → Claude dispatches each `_mcp_call`.
+
 ## Alpaca MCP Tools
 
 All brokerage interaction uses the `mcp__alpaca__*` tool namespace — no HTTP client needed.
@@ -29,16 +75,7 @@ Always call `get_clock` before any order. If `is_open: false`, exit immediately 
 
 - Language: Python 3.12+
 - Shared `.venv` at workspace root (`C:\workspace\.venv`)
-- The `wheel/` modules are run as scripts **from the `wheel/` directory** so that relative imports (`from config import ...`) resolve correctly.
-
-```powershell
-# Run screener (reads live data injected by Claude)
-cd C:\workspace\Trade-bot\wheel
-python screener.py
-
-# Run monitor
-python monitor.py
-```
+- The `wheel/` modules are run **from the `wheel/` directory** so that relative imports (`from config import ...`) resolve correctly.
 
 In practice, Claude calls the MCP tools to collect all data, then passes the result dicts directly into `monitor.run(...)` or `screener.run(...)` — the scripts are not run as CLI subprocesses during normal operation.
 
@@ -86,41 +123,49 @@ All strategy constants — delta range, DTE window, profit/loss thresholds, draw
 | `DRAWDOWN_PAUSE/REDUCE/DISABLE` | 5% / 8% / 12% | Portfolio drawdown gates |
 | `MAX_BP_COMMITTED` | 0.50 | Max 50% of portfolio in open puts |
 | `MIN_CASH_RESERVE_PCT` | 0.25 | Always keep 25% cash |
-| `DEFAULT_MAX_POSITION_PCT` | 0.10 | Per-symbol assignment cap |
+| `DEFAULT_MAX_POSITION_PCT` | 0.30 | Per-symbol assignment cap (overridable in watchlist) |
+| `MAX_SECTOR_EXPOSURE` | 0.30 | Max 30% of portfolio in puts on correlated names |
 | `ROLL_PUT_THRESH` | 0.03 | Roll put when stock within 3% of strike |
 | `ROLL_CALL_THRESH` | 0.05 | Roll call when stock 5%+ above call strike |
 | `MARKET_OPEN_BUFFER_MIN` | 15 | Skip first 15 min after open |
 | `MARKET_CLOSE_BUFFER_MIN` | 15 | Skip last 15 min before close |
+| `ORDER_ADJUSTMENT_MAX` | 3 | Max GTC limit-price adjustments per entry order |
 
 ## State and Log Files
 
 | File | Purpose |
 |---|---|
 | `wheel/state.json` | Per-symbol wheel stage, option contract, cost basis, premiums, cycle metadata |
-| `wheel/watchlist.json` | Symbols eligible for the wheel — `enabled`, `earnings_date`, `ex_dividend_date`, `max_position_pct` override |
+| `wheel/watchlist.json` | Symbols eligible for the wheel — `enabled`, `sector`, `earnings_date`, `ex_dividend_date`, `max_position_pct` override |
 | `trades/wheel_log.md` | Append-only strategy action log |
 | `trades/trades_log.md` | Portfolio log (replicated from Fidelity export) |
+
+`watchlist.json` `sector` field drives the sector exposure cap (`MAX_SECTOR_EXPOSURE`). Per-symbol `max_position_pct` overrides `DEFAULT_MAX_POSITION_PCT` (e.g. QQQ uses 0.07 due to its high strike price).
 
 `state.json` schema per symbol:
 ```json
 {
   "stage": 1,
-  "option_symbol": "AAPL260605P00260000",
-  "premium_collected": 0.91,
-  "fill_price": null,
-  "entry_price": 270.0,
+  "option_symbol": "AAPL260612P00285000",
+  "premium_collected": 4.30,
+  "fill_price": 4.30,
+  "entry_price": 294.38,
   "cost_basis": null,
   "shares_qty": 0,
-  "cycle_start": "2026-05-08",
-  "expiry_date": "2026-06-05",
-  "breakeven": 259.09,
-  "max_risk": 25909.0,
-  "total_premium_all_cycles": 0.91,
+  "cycle_start": "2026-05-12",
+  "expiry_date": "2026-06-12",
+  "breakeven": 280.70,
+  "max_risk": 28070.0,
+  "total_premium_all_cycles": 4.30,
   "roll_count": 0,
   "cycle_number": 1,
-  "order_status": "pending_fill"
+  "order_status": "pending_fill",
+  "adjustment_count": 0,
+  "alpaca_order_id": "..."
 }
 ```
+
+`order_status` values: `"pending_fill"` (GTC order open) → `"filled"` (confirmed in positions). Monitor's `_reconcile_pending_fills` drives this transition; `_adjust_pending_entries` steps the limit price toward bid each cycle until `adjustment_count` reaches `ORDER_ADJUSTMENT_MAX`, then cancels.
 
 ## OCC Contract Symbol Parsing
 
@@ -131,7 +176,7 @@ strike = int(contract[-8:]) / 1000        # last 8 digits = strike × 1000
 exp    = "20" + contract[len(symbol):len(symbol)+6]  # YYMMDD after ticker
 ```
 
-This pattern is used in `screener.py`, `monitor.py`, and `roller.py`.
+All OCC utilities live in `occ.py`: `parse_strike`, `parse_expiry`, `expiry_tag`, `find_expiry`.
 
 ## Order Execution Pattern
 
@@ -175,4 +220,5 @@ Full `_mcp_call` dispatch table:
 6. **Market hours guard** — `get_clock().is_open == false` → exit, no orders.
 7. **Earnings gate** — skip any expiry with earnings before expiration date.
 8. **No debit rolls** — rolls must produce net credit ≥ $0.05.
-9. **Position cap** — single symbol assignment value ≤ 10% of portfolio (overridable per symbol in watchlist).
+9. **Position cap** — single symbol assignment value ≤ 30% of portfolio (overridable per symbol in watchlist).
+10. **Sector cap** — no more than 30% of portfolio in puts on same-sector names.

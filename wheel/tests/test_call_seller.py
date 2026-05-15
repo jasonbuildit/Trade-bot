@@ -125,3 +125,48 @@ class TestHappyPath:
         assert saved["symbols"][TICKER]["stage"] == 2
         assert saved["symbols"][TICKER]["order_status"] == "pending_fill"
         assert saved["symbols"][TICKER]["shares_qty"] == 100
+
+
+# ── Dividend risk block ───────────────────────────────────────────────────────
+
+class TestDividendBlock:
+    def _make_watchlist(self, ex_div: str | None, allow_div_risk: bool = False) -> list[dict]:
+        return [{"symbol": TICKER, "ex_dividend_date": ex_div, "allow_div_risk": allow_div_risk}]
+
+    def test_blocks_when_ex_div_before_expiry(self):
+        # Expiry will be ~30 DTE; set ex-div far in the future but before expiry
+        expiry = TRADING_DAYS[15]["date"]  # ~30 DTE entry
+        wl = self._make_watchlist(ex_div=expiry)  # ex-div == expiry → blocks
+        with (
+            patch("call_seller.load_state", return_value=make_state()),
+            patch("call_seller.save_state"),
+            patch("call_seller.append_log"),
+            patch("call_seller._allow_div_risk", return_value=False),
+            patch("call_seller._check_dividend_risk", return_value={"blocked": True, "reason": "test"}),
+        ):
+            result = call_seller.run(TICKER, COST_BASIS, PREMIUMS,
+                                     call_chain(strike=290), TRADING_DAYS, dry_run=True)
+        assert result is None
+
+    def test_allows_when_allow_div_risk_true(self):
+        with (
+            patch("call_seller.load_state", return_value=make_state()),
+            patch("call_seller.save_state"),
+            patch("call_seller.append_log"),
+            patch("call_seller._allow_div_risk", return_value=True),
+            patch("call_seller._check_dividend_risk", return_value={"blocked": True, "reason": "test"}),
+        ):
+            result = call_seller.run(TICKER, COST_BASIS, PREMIUMS,
+                                     call_chain(strike=290), TRADING_DAYS, dry_run=True)
+        assert result is not None
+
+    def test_passes_when_no_dividend(self):
+        with (
+            patch("call_seller.load_state", return_value=make_state()),
+            patch("call_seller.save_state"),
+            patch("call_seller.append_log"),
+            patch("call_seller._check_dividend_risk", return_value={"blocked": False}),
+        ):
+            result = call_seller.run(TICKER, COST_BASIS, PREMIUMS,
+                                     call_chain(strike=290), TRADING_DAYS, dry_run=True)
+        assert result is not None

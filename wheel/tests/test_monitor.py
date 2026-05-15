@@ -290,3 +290,199 @@ class TestAssignmentGuard:
         result = self._run_monitor(state, positions)
         actions = result.get("actions", [])
         assert any(a["action"] == "assigned_to_stage2" for a in actions)
+
+
+# ── Gamma-accelerated exit ────────────────────────────────────────────────────
+
+class TestGammaAcceleratedExit:
+    def _make_chains_with_gamma(self, gamma: float) -> dict:
+        from fixtures import PUT_SYM
+        return {
+            "AAPL": {
+                "puts": {
+                    PUT_SYM: {
+                        "greeks": {"gamma": gamma, "delta": -0.25},
+                        "latestQuote": {"bp": 0.20, "ap": 0.22},
+                    }
+                },
+                "calls": {},
+            }
+        }
+
+    def test_gamma_exit_fires_at_25pct_profit_when_dte_low_and_gamma_high(self):
+        # DTE ~3 days: use a near-term expiry
+        from datetime import date, timedelta
+        expiry = (date.today() + timedelta(days=3)).isoformat()
+        sym_state = put_symbol_state(order_status="filled")
+        sym_state["expiry_date"] = expiry
+        state = make_state({"AAPL": sym_state})
+
+        # 25% profit: cost_basis=-96, unrealized_pl=24 → 25% threshold
+        opt_pos = short_put_position(unrealized_pl=24.0, cost_basis=-96.0, market_value=-72.0)
+        chains = self._make_chains_with_gamma(gamma=0.08)  # above GAMMA_HIGH_THRESHOLD
+
+        with (
+            patch("monitor.load_state", return_value=state),
+            patch("monitor.save_state"),
+            patch("monitor.append_log"),
+            patch("put_seller.run", return_value=None),
+            patch("call_seller.run", return_value=None),
+        ):
+            from fixtures import ACCOUNT, CLOCK_OPEN, SNAPSHOT, make_trading_days
+            result = monitor.run(
+                clock=CLOCK_OPEN,
+                positions=[opt_pos],
+                open_orders=[],
+                account=ACCOUNT,
+                option_chains=chains,
+                trading_days=make_trading_days(),
+                snapshots=SNAPSHOT,
+                dry_run=True,
+            )
+        actions = result.get("actions", [])
+        assert any(a.get("action") == "gamma_exit_put" for a in actions), \
+            f"Expected gamma_exit_put, got {[a.get('action') for a in actions]}"
+
+    def test_gamma_exit_does_not_fire_when_gamma_low(self):
+        from datetime import date, timedelta
+        expiry = (date.today() + timedelta(days=3)).isoformat()
+        sym_state = put_symbol_state(order_status="filled")
+        sym_state["expiry_date"] = expiry
+        state = make_state({"AAPL": sym_state})
+
+        opt_pos = short_put_position(unrealized_pl=24.0, cost_basis=-96.0, market_value=-72.0)
+        chains = self._make_chains_with_gamma(gamma=0.01)  # below threshold
+
+        with (
+            patch("monitor.load_state", return_value=state),
+            patch("monitor.save_state"),
+            patch("monitor.append_log"),
+            patch("put_seller.run", return_value=None),
+            patch("call_seller.run", return_value=None),
+        ):
+            from fixtures import ACCOUNT, CLOCK_OPEN, SNAPSHOT, make_trading_days
+            result = monitor.run(
+                clock=CLOCK_OPEN,
+                positions=[opt_pos],
+                open_orders=[],
+                account=ACCOUNT,
+                option_chains=chains,
+                trading_days=make_trading_days(),
+                snapshots=SNAPSHOT,
+                dry_run=True,
+            )
+        actions = result.get("actions", [])
+        assert not any(a.get("action") == "gamma_exit_put" for a in actions)
+
+    def test_gamma_exit_does_not_fire_when_dte_high(self):
+        from datetime import date, timedelta
+        expiry = (date.today() + timedelta(days=30)).isoformat()  # DTE well above threshold
+        sym_state = put_symbol_state(order_status="filled")
+        sym_state["expiry_date"] = expiry
+        state = make_state({"AAPL": sym_state})
+
+        opt_pos = short_put_position(unrealized_pl=24.0, cost_basis=-96.0, market_value=-72.0)
+        chains = self._make_chains_with_gamma(gamma=0.08)  # high gamma, but DTE too far
+
+        with (
+            patch("monitor.load_state", return_value=state),
+            patch("monitor.save_state"),
+            patch("monitor.append_log"),
+            patch("put_seller.run", return_value=None),
+            patch("call_seller.run", return_value=None),
+        ):
+            from fixtures import ACCOUNT, CLOCK_OPEN, SNAPSHOT, make_trading_days
+            result = monitor.run(
+                clock=CLOCK_OPEN,
+                positions=[opt_pos],
+                open_orders=[],
+                account=ACCOUNT,
+                option_chains=chains,
+                trading_days=make_trading_days(),
+                snapshots=SNAPSHOT,
+                dry_run=True,
+            )
+        actions = result.get("actions", [])
+        assert not any(a.get("action") == "gamma_exit_put" for a in actions)
+
+
+# ── Vol regime gate ────────────────────────────────────────────────────────────
+
+class TestVolRegimeGate:
+    def _run_with_vol_cache(self, regime: str, state=None):
+        from datetime import date
+        vol_cache = {
+            "date": date.today().isoformat(),
+            "symbols": {TICKER: {"iv_rank": 0.90 if regime == "panic" else 0.10, "regime": regime}},
+        }
+        if state is None:
+            state = make_state({TICKER: put_symbol_state(order_status="filled")})
+
+        put_seller_calls = []
+
+        def capture_put_seller(*args, **kwargs):
+            put_seller_calls.append(True)
+            return None
+
+        with (
+            patch("monitor.load_state", return_value=state),
+            patch("monitor.save_state"),
+            patch("monitor.append_log"),
+            patch("put_seller.run", side_effect=capture_put_seller),
+            patch("call_seller.run", return_value=None),
+        ):
+            from fixtures import ACCOUNT, CLOCK_OPEN, SNAPSHOT, make_trading_days, short_put_position
+            # Position at 50% profit → will try to redeploy after closing
+            opt_pos = short_put_position(unrealized_pl=48.0, cost_basis=-96.0, market_value=-48.0)
+            result = monitor.run(
+                clock=CLOCK_OPEN,
+                positions=[opt_pos],
+                open_orders=[],
+                account=ACCOUNT,
+                option_chains={"AAPL": {"puts": {}, "calls": {}}},
+                trading_days=make_trading_days(),
+                snapshots=SNAPSHOT,
+                dry_run=True,
+                vol_cache=vol_cache,
+            )
+        return put_seller_calls, result
+
+    def test_panic_regime_blocks_new_put_entry(self):
+        calls, result = self._run_with_vol_cache("panic")
+        assert len(calls) == 0, "put_seller.run should not be called in panic regime"
+
+    def test_low_regime_blocks_new_put_entry(self):
+        calls, result = self._run_with_vol_cache("low")
+        assert len(calls) == 0, "put_seller.run should not be called in low IV regime"
+
+    def test_normal_regime_allows_new_put_entry(self):
+        from datetime import date
+        vol_cache = {
+            "date": date.today().isoformat(),
+            "symbols": {TICKER: {"iv_rank": 0.45, "regime": "normal"}},
+        }
+        state = make_state({TICKER: put_symbol_state(order_status="filled")})
+        put_seller_calls = []
+
+        with (
+            patch("monitor.load_state", return_value=state),
+            patch("monitor.save_state"),
+            patch("monitor.append_log"),
+            patch("put_seller.run", side_effect=lambda *a, **k: put_seller_calls.append(True) or None),
+            patch("call_seller.run", return_value=None),
+            patch("monitor._in_trading_window", return_value=True),  # force inside window
+        ):
+            from fixtures import ACCOUNT, CLOCK_OPEN, SNAPSHOT, make_trading_days, short_put_position
+            opt_pos = short_put_position(unrealized_pl=48.0, cost_basis=-96.0, market_value=-48.0)
+            monitor.run(
+                clock=CLOCK_OPEN,
+                positions=[opt_pos],
+                open_orders=[],
+                account=ACCOUNT,
+                option_chains={"AAPL": {"puts": {}, "calls": {}}},
+                trading_days=make_trading_days(),
+                snapshots=SNAPSHOT,
+                dry_run=True,
+                vol_cache=vol_cache,
+            )
+        assert len(put_seller_calls) == 1, "put_seller.run should be called in normal regime"

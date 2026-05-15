@@ -35,6 +35,9 @@ from config import (
     UNDERLYING_BLOCK_PCT,
     EARNINGS_PROXIMITY_DAYS,
     ORDER_ADJUSTMENT_MAX,
+    GAMMA_DTE_THRESHOLD,
+    GAMMA_HIGH_THRESHOLD,
+    GAMMA_PROFIT_CLOSE_PCT,
 )
 
 ROOT = Path(__file__).parent.parent
@@ -246,6 +249,61 @@ def _can_redeploy(symbol: str, now_et: datetime, sym_meta: dict, drawdown: float
     return True
 
 
+def _vol_regime_allows_entry(symbol: str, vol_cache: dict | None) -> bool:
+    """Returns False if vol cache shows a "low" or "panic" regime — bad time to sell puts."""
+    if not vol_cache:
+        return True
+    regime = vol_cache.get("symbols", {}).get(symbol, {}).get("regime")
+    if regime in ("low", "panic"):
+        iv_rank = vol_cache.get("symbols", {}).get(symbol, {}).get("iv_rank", "?")
+        print(
+            f"[monitor] {symbol}: new put blocked — IV regime '{regime}' "
+            f"(rank {iv_rank:.0%})" if isinstance(iv_rank, float) else
+            f"[monitor] {symbol}: new put blocked — IV regime '{regime}'"
+        )
+        return False
+    return True
+
+
+def _find_contract_greeks(option_sym: str, option_chains: dict) -> dict:
+    """Look up greeks for a tracked contract from the already-fetched chains dict."""
+    for sym_chains in option_chains.values():
+        for side in ("puts", "calls"):
+            contracts = sym_chains.get(side, {})
+            if option_sym in contracts:
+                return contracts[option_sym].get("greeks", {}) or {}
+    return {}
+
+
+def _days_to_expiry(expiry_str: str | None) -> int | None:
+    if not expiry_str:
+        return None
+    try:
+        return (date.fromisoformat(expiry_str) - date.today()).days
+    except Exception:
+        return None
+
+
+def is_gamma_profit(position: dict, option_sym: str, expiry_str: str | None,
+                    option_chains: dict) -> bool:
+    """
+    Accelerated exit: when DTE is low and gamma is elevated, take profit at 25%
+    to avoid gamma risk near expiry pinning the position against us.
+    """
+    dte = _days_to_expiry(expiry_str)
+    if dte is None or dte >= GAMMA_DTE_THRESHOLD:
+        return False
+    greeks = _find_contract_greeks(option_sym, option_chains)
+    gamma = abs(greeks.get("gamma", 0) or 0)
+    if gamma < GAMMA_HIGH_THRESHOLD:
+        return False
+    cost_basis = float(position.get("cost_basis", 0))
+    unrealized_pl = float(position.get("unrealized_pl", 0))
+    if cost_basis >= 0:
+        return False
+    return unrealized_pl >= abs(cost_basis) * GAMMA_PROFIT_CLOSE_PCT
+
+
 def is_fast_profit(position: dict) -> bool:
     """Close early when 75%+ of max profit is reached — don't wait for pennies."""
     cost_basis = float(position.get("cost_basis", 0))
@@ -311,6 +369,7 @@ def run(
     trading_days: list,
     snapshots: dict,
     dry_run: bool = False,
+    vol_cache: dict | None = None,
 ) -> dict:
     """
     Main monitor entry point. All MCP data injected by Claude.
@@ -323,6 +382,7 @@ def run(
     trading_days:  get_calendar() result
     snapshots:     {symbol: snapshot} — get_stock_snapshot per watchlist symbol
     dry_run:       skip actual order placement
+    vol_cache:     output of volatility.load_vol_cache() — drives IV regime gate for new entries
     """
     actions = []
     now_et = datetime.now(ET)
@@ -450,6 +510,8 @@ def run(
                 if mode == "pause" or not in_window or underlying_blocked:
                     reason = "drawdown pause" if mode == "pause" else ("outside window" if not in_window else "underlying blocked")
                     print(f"[monitor] {symbol}: skipping new put — {reason}")
+                elif not _vol_regime_allows_entry(symbol, vol_cache):
+                    pass  # already logged in helper
                 else:
                     puts = option_chains.get(symbol, {}).get("puts", {})
                     result = put_seller.run(
@@ -479,6 +541,24 @@ def run(
                         "close_order": close_order,
                     })
 
+                # Gamma-accelerated exit (DTE < 7, high gamma — take 25% profit)
+                elif is_gamma_profit(option_pos, option_sym,
+                                     sym_state.get("expiry_date"), option_chains):
+                    print(
+                        f"[monitor] {symbol}: GAMMA EXIT on {option_sym} | "
+                        f"P/L ${pl:.2f} — DTE low, gamma elevated, closing at 25% profit"
+                    )
+                    close_order = _close_order(option_sym, limit_price=_mark_price(option_pos))
+                    if not dry_run:
+                        append_log(
+                            f"## {today} — Gamma-Accelerated Exit (Stage 1)\n"
+                            f"Symbol: {symbol} | Closed put: {option_sym} | P/L: ${pl:.2f}"
+                        )
+                    actions.append({
+                        "symbol": symbol, "action": "gamma_exit_put",
+                        "close_order": close_order,
+                    })
+
                 # 75% fast profit rule (check before 50%)
                 elif is_fast_profit(option_pos):
                     print(f"[monitor] {symbol}: 75% FAST PROFIT on {option_sym} | P/L ${pl:.2f}")
@@ -489,7 +569,9 @@ def run(
                             f"Symbol: {symbol} | Closed put: {option_sym} | P/L: ${pl:.2f}"
                         )
                     new_put = None
-                    if _can_redeploy(symbol, now_et, sym_meta, drawdown) and not underlying_blocked:
+                    if (_can_redeploy(symbol, now_et, sym_meta, drawdown)
+                            and not underlying_blocked
+                            and _vol_regime_allows_entry(symbol, vol_cache)):
                         puts = option_chains.get(symbol, {}).get("puts", {})
                         new_put = put_seller.run(
                             symbol, current_price, buying_power, puts, trading_days,
@@ -510,7 +592,9 @@ def run(
                             f"Symbol: {symbol} | Closed put: {option_sym} | P/L: ${pl:.2f}"
                         )
                     new_put = None
-                    if _can_redeploy(symbol, now_et, sym_meta, drawdown) and not underlying_blocked:
+                    if (_can_redeploy(symbol, now_et, sym_meta, drawdown)
+                            and not underlying_blocked
+                            and _vol_regime_allows_entry(symbol, vol_cache)):
                         puts = option_chains.get(symbol, {}).get("puts", {})
                         new_put = put_seller.run(
                             symbol, current_price, buying_power, puts, trading_days,
@@ -586,7 +670,9 @@ def run(
                 save_state(state)
 
                 new_put = None
-                if in_window and mode != "pause" and _can_redeploy(symbol, now_et, sym_meta, drawdown):
+                if (in_window and mode != "pause"
+                        and _can_redeploy(symbol, now_et, sym_meta, drawdown)
+                        and _vol_regime_allows_entry(symbol, vol_cache)):
                     puts = option_chains.get(symbol, {}).get("puts", {})
                     new_put = put_seller.run(
                         symbol, current_price, buying_power, puts, trading_days,
@@ -707,6 +793,22 @@ def run(
                             print(f"[monitor] {symbol}: no credit roll-up available — holding")
                     else:
                         print(f"[monitor] {symbol}: Stage 2 holding | P/L ${pl:.2f}")
+
+    # ── Spread / condor dispatcher ────────────────────────────────────────────
+    # Lazily imported so Tier-2/3 modules are optional until created
+    if state.get("spread_positions") or state.get("condor_positions"):
+        try:
+            import spread_monitor
+            for spread in state.get("spread_positions", []):
+                actions.extend(spread_monitor.process(spread, option_chains, positions, trading_days, dry_run))
+        except ImportError:
+            pass
+        try:
+            import condor_monitor
+            for condor in state.get("condor_positions", []):
+                actions.extend(condor_monitor.process(condor, option_chains, positions, trading_days, dry_run))
+        except ImportError:
+            pass
 
     # ── Daily summary (run in final 15 min of trading day) ───────────────────
     close_summary_dt = now_et.replace(hour=15, minute=45, second=0, microsecond=0)

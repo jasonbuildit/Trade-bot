@@ -63,8 +63,24 @@ def find_call_contract(calls: dict, target_strike: float, min_strike: float) -> 
     return candidates[0]
 
 
-def _check_dividend_risk(symbol: str, expiry: str):
-    """Log a warning if ex-dividend date falls before the call expiry (early assignment risk)."""
+def _allow_div_risk(symbol: str) -> bool:
+    """Returns True if the watchlist explicitly opts this symbol into dividend risk."""
+    try:
+        with open(WATCHLIST_FILE) as f:
+            data = json.load(f)
+        for item in data.get("symbols", []):
+            if isinstance(item, dict) and item.get("symbol") == symbol:
+                return bool(item.get("allow_div_risk", False))
+    except Exception:
+        pass
+    return False
+
+
+def _check_dividend_risk(symbol: str, expiry: str) -> dict:
+    """
+    Returns {"blocked": True, "reason": str} if ex-dividend date falls before call expiry.
+    Returns {"blocked": False} if no risk or no ex-div date.
+    """
     try:
         with open(WATCHLIST_FILE) as f:
             data = json.load(f)
@@ -72,13 +88,17 @@ def _check_dividend_risk(symbol: str, expiry: str):
             if isinstance(item, dict) and item.get("symbol") == symbol:
                 ex_div = item.get("ex_dividend_date")
                 if ex_div and ex_div <= expiry:
-                    print(
-                        f"[call_seller] {symbol}: WARNING — ex-dividend {ex_div} falls "
-                        f"before call expiry {expiry}. Early assignment risk: review before placing."
-                    )
+                    return {
+                        "blocked": True,
+                        "reason": (
+                            f"ex-dividend {ex_div} falls before call expiry {expiry} — "
+                            f"early assignment risk (set allow_div_risk: true in watchlist to override)"
+                        ),
+                    }
                 break
     except Exception:
         pass
+    return {"blocked": False}
 
 
 def run(
@@ -119,7 +139,12 @@ def run(
         print(f"[call_seller] {symbol}: no valid expiry found in 21–45 DTE window")
         return None
 
-    _check_dividend_risk(symbol, expiry)
+    div_check = _check_dividend_risk(symbol, expiry)
+    if div_check["blocked"] and not _allow_div_risk(symbol):
+        print(f"[call_seller] {symbol}: BLOCKED — {div_check['reason']}")
+        return None
+    elif div_check["blocked"]:
+        print(f"[call_seller] {symbol}: WARNING (allow_div_risk=true) — {div_check['reason']}")
 
     # Filter calls to target expiry
     expiry_calls = {k: v for k, v in calls.items() if _expiry_tag(expiry) in k}

@@ -178,11 +178,14 @@ def run(
     # ── Portfolio-level BP committed cap (50%) ────────────────────────────────
     if portfolio_value > 0:
         state_now = load_state()
-        total_committed = sum(
+        wheel_committed = sum(
             s.get("max_risk", 0) or 0
             for s in state_now["symbols"].values()
             if s.get("stage") == 1
         )
+        spread_committed = sum(s.get("max_risk", 0) or 0 for s in state_now.get("spread_positions", []))
+        condor_committed = sum(c.get("max_risk", 0) or 0 for c in state_now.get("condor_positions", []))
+        total_committed  = wheel_committed + spread_committed + condor_committed
         if (total_committed + cash_required) / portfolio_value > MAX_BP_COMMITTED:
             print(
                 f"[put_seller] {symbol}: total open puts ${total_committed:,.0f} + "

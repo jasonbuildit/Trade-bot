@@ -9,6 +9,7 @@ Filters applied (in order):
   4. Stale OI proxy    — skip if zero volume and stale daily bar
   5. IV floor          — flag if ATM IV < 20% (low premium environment)
   6. Trend filter      — flag if price < SMA-21 (downtrend; auto-skip in strict mode)
+  7. Vol regime gate   — skip in strict mode if IV rank is "low" or "panic"
 
 Run: python wheel/screener.py
 """
@@ -58,16 +59,23 @@ def score_candidate(
     earnings_date: str | None = None,
     strict_trend: bool = True,
     sma21: float | None = None,
+    vol_cache: dict | None = None,
 ) -> list[dict]:
     """
     Score each put contract. Returns list of dicts sorted by annualized yield descending.
     puts: {contract_symbol: snapshot_data}
+    vol_cache: output of volatility.load_vol_cache() — optional regime gate
     """
     target_strike = round(current_price * 0.90)
     results = []
     skipped = {"earnings": 0, "delta": 0, "spread": 0, "stale": 0, "no_bid": 0}
 
     trend_down = sma21 is not None and current_price < sma21
+
+    # IV regime from cache (None if cache absent or symbol not in cache)
+    sym_vol = (vol_cache or {}).get("symbols", {}).get(symbol, {})
+    iv_rank = sym_vol.get("iv_rank")
+    regime  = sym_vol.get("regime")
 
     for contract, data in puts.items():
         quote = data.get("latestQuote", {})
@@ -120,14 +128,22 @@ def score_candidate(
         annualized_yield = (mid / strike) * (365 / days) * 100 if days and days > 0 else 0
         raw_yield_pct = (mid / strike) * 100
 
+        # Theta yield: daily theta decay as fraction of capital committed
+        greeks = data.get("greeks", {}) or {}
+        theta_raw = abs(greeks.get("theta", 0) or 0)
+        theta_yield = theta_raw / (strike * 100) if strike > 0 else 0.0
+
         flags = []
         if iv_low:
             flags.append("IV_LOW")
         if trend_down:
             flags.append("TREND_DOWN")
+        if regime in ("low", "panic"):
+            flags.append("IV_REGIME_BLOCK")
 
-        # In strict mode, skip trend-down and IV-low
-        if strict_trend and ("TREND_DOWN" in flags or "IV_LOW" in flags):
+        # In strict mode, skip trend-down, IV-low, and IV regime blocks
+        skip_flags = {"TREND_DOWN", "IV_LOW", "IV_REGIME_BLOCK"}
+        if strict_trend and any(f in flags for f in skip_flags):
             continue
 
         results.append({
@@ -141,7 +157,11 @@ def score_candidate(
             "expiry": expiry_date_str,
             "yield_pct": round(raw_yield_pct, 3),
             "ann_yield": round(annualized_yield, 2),
+            "theta": round(theta_raw, 4),
+            "theta_yield": round(theta_yield, 8),
             "iv": round(iv * 100, 1),
+            "iv_rank": round(iv_rank, 4) if iv_rank is not None else None,
+            "regime": regime,
             "delta": round(delta, 3),
             "spread_pct": round(spread_pct * 100, 1),
             "distance_from_target": abs(strike - target_strike),
@@ -183,12 +203,16 @@ def run(
     option_chains: dict,
     bars: dict | None = None,
     strict_trend: bool = True,
+    vol_cache: dict | None = None,
+    sort_by: str = "ann_yield",
 ) -> dict | None:
     """
     snapshots:     {symbol: snapshot_data}  — from mcp__alpaca__get_stock_snapshot
     option_chains: {symbol: puts_dict}      — from mcp__alpaca__get_option_chain per symbol
     bars:          {symbol: [bar, ...]}     — from mcp__alpaca__get_stock_bars (21 daily bars)
-    strict_trend:  if True, auto-skip trend-down and IV-low symbols
+    strict_trend:  if True, auto-skip trend-down, IV-low, and IV-regime-blocked symbols
+    vol_cache:     output of volatility.load_vol_cache() — drives IV regime gate
+    sort_by:       "ann_yield" (default) or "theta_yield" (theta/capital)
 
     Returns: best candidate dict or None
     """
@@ -231,12 +255,15 @@ def run(
             earnings_date=earnings_date,
             strict_trend=strict_trend,
             sma21=sma21,
+            vol_cache=vol_cache,
         )
 
+        sym_vol = (vol_cache or {}).get("symbols", {}).get(symbol, {})
+        regime_str = f" | IV rank {sym_vol['iv_rank']:.0%} [{sym_vol['regime']}]" if sym_vol else ""
         target = round(current_price * 0.90)
         sma_str = f" | SMA21 ${sma21:.2f}" if sma21 else ""
         trend_str = " ⚠ DOWNTREND" if (sma21 and current_price < sma21) else ""
-        print(f"\n{symbol} @ ${current_price:.2f} — target strike ${target}{sma_str}{trend_str}")
+        print(f"\n{symbol} @ ${current_price:.2f} — target strike ${target}{sma_str}{regime_str}{trend_str}")
         print_table(candidates)
         all_candidates.extend(candidates)
 
@@ -244,11 +271,16 @@ def run(
         print("\nNo candidates passed all filters.")
         return None
 
-    all_candidates.sort(key=lambda x: -x["ann_yield"])
+    if sort_by == "theta_yield":
+        all_candidates.sort(key=lambda x: -x["theta_yield"])
+    else:
+        all_candidates.sort(key=lambda x: -x["ann_yield"])
+
     best = all_candidates[0]
     print(
         f"\n★ Best pick: {best['symbol']} {best['contract']} | "
         f"Mid ${best['mid']} | Ann yield {best['ann_yield']}% | "
+        f"Theta yield {best['theta_yield']:.6f} | "
         f"IV {best['iv']}% | Delta {best['delta']} | DTE {best['dte']}"
     )
     return best

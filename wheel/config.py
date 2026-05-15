@@ -50,3 +50,25 @@ MAX_SECTOR_EXPOSURE = 0.30  # max 30% of portfolio in puts on correlated names (
 
 # ── Order execution ladder ───────────────────────────────────────────────────
 ORDER_ADJUSTMENT_MAX = 3  # max price adjustments per entry order (one per monitor cycle)
+
+# ── Volatility regime (Tier 1) ───────────────────────────────────────────────
+IV_RANK_MIN_ENTRY     = 0.30  # below → skip new puts (premiums too thin)
+IV_RANK_PREFERRED_MIN = 0.50  # optimal entry zone floor
+IV_RANK_PANIC         = 0.85  # above → gap risk, block entries
+HV_LOOKBACK_DAYS      = 252   # bars for annual HV computation
+HV_SHORT_WINDOW       = 21    # short HV window
+
+# ── Gamma-accelerated exits (Tier 1) ─────────────────────────────────────────
+GAMMA_DTE_THRESHOLD    = 7     # DTE below this → gamma risk elevated
+GAMMA_HIGH_THRESHOLD   = 0.05  # gamma above this → accelerate profit close
+GAMMA_PROFIT_CLOSE_PCT = 0.25  # profit target when gamma is elevated near expiry
+
+# ── Put credit spreads (Tier 2) ───────────────────────────────────────────────
+SPREAD_WIDTH_DEFAULT  = 10    # dollar width between short and long put legs
+SPREAD_MIN_CREDIT_PCT = 0.25  # min net_credit / (spread_width × 100)
+SPREAD_MAX_LOSS_MULT  = 1.00  # close spread when loss >= 100% of max_risk
+
+# ── Iron condors (Tier 3) ────────────────────────────────────────────────────
+CONDOR_SHORT_DELTA    = 0.16  # target delta for both short legs
+CONDOR_WING_WIDTH     = 5     # wing width in dollars (each side)
+CONDOR_MIN_CREDIT_PCT = 0.25  # min net_credit / (wing_width × 100)

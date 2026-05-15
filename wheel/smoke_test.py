@@ -13,8 +13,10 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent))
 
 import monitor
+import spread_monitor
+import condor_monitor
 from tests.fixtures import (
-    TICKER, PUT_SYM, CALL_SYM,
+    TICKER, PUT_SYM, CALL_SYM, EXPIRY_OCC, EXPIRY_ISO,
     ACCOUNT, CLOCK_OPEN, CLOCK_CLOSED, SNAPSHOT,
     make_state, put_symbol_state, call_symbol_state,
     short_put_position, short_call_position, share_position,
@@ -202,6 +204,184 @@ action = next((a for a in actions if a.get("action") == "cancel_unfilled_entry")
 check("cancel_order_by_id dispatched", action.get("_mcp_call") == "cancel_order_by_id")
 
 
+# ── Vol regime gate: panic blocks new put ────────────────────────────────────
+
+scenario("13. Vol regime panic -> new put entry blocked after profit close")
+state = make_state({"AAPL": put_symbol_state(order_status="filled")})
+opt_pos = short_put_position(unrealized_pl=48.0, cost_basis=-96.0, market_value=-48.0)
+vol_cache = {"symbols": {"AAPL": {"regime": "panic", "iv_rank": 0.90}}}
+with (
+    patch("monitor.load_state", return_value=state),
+    patch("monitor.save_state"),
+    patch("monitor.append_log"),
+    patch("put_seller.load_state", return_value=state),
+    patch("put_seller.save_state"),
+    patch("put_seller.append_log"),
+    patch("call_seller.load_state", return_value=state),
+    patch("call_seller.save_state"),
+    patch("call_seller.append_log"),
+    patch("monitor._in_trading_window", return_value=True),
+):
+    result_vol = monitor.run(
+        clock=CLOCK_OPEN,
+        positions=[opt_pos],
+        open_orders=[],
+        account=ACCOUNT,
+        option_chains=CHAINS,
+        trading_days=TRADING_DAYS,
+        snapshots=SNAPSHOT,
+        dry_run=True,
+        vol_cache=vol_cache,
+    )
+actions = result_vol.get("actions", [])
+check("50pct_close_put fired", any(a.get("action") == "50pct_close_put" for a in actions))
+check("no new_order after close (blocked by panic)", not any(a.get("action") == "new_order" for a in actions))
+
+
+# ── Put spread: 50% profit close ─────────────────────────────────────────────
+
+SHORT_STRIKE = 252
+LONG_STRIKE  = 242
+SHORT_SYM = f"{TICKER}{EXPIRY_OCC}P{int(SHORT_STRIKE * 1000):08d}"
+LONG_SYM  = f"{TICKER}{EXPIRY_OCC}P{int(LONG_STRIKE  * 1000):08d}"
+NET_CREDIT_SPREAD = 2.60
+
+spread_position = {
+    "id": f"{TICKER}-put-spread-smoke",
+    "symbol": TICKER,
+    "strategy": "put_spread",
+    "stage": "open",
+    "short_contract": SHORT_SYM,
+    "long_contract":  LONG_SYM,
+    "short_strike": SHORT_STRIKE,
+    "long_strike":  LONG_STRIKE,
+    "spread_width": 10,
+    "net_credit": NET_CREDIT_SPREAD,
+    "max_risk": round((10 * 100) - NET_CREDIT_SPREAD * 100, 2),
+    "expiry_date": EXPIRY_ISO,
+    "cycle_start": "2026-05-15",
+    "order_status": "filled",
+    "adjustment_count": 0,
+    "entry_iv_rank": 0.65,
+    "entry_delta_short": 0.25,
+}
+
+scenario("14. Put spread at 50% profit -> 2-leg close emitted")
+spread_chains = {
+    TICKER: {
+        "puts": {
+            SHORT_SYM: {"latestQuote": {"bp": 1.00, "ap": 1.00}},
+            LONG_SYM:  {"latestQuote": {"bp": 0.10, "ap": 0.15}},
+        },
+        "calls": {},
+    }
+}
+# debit = short_ask - long_bid = 1.00 - 0.10 = 0.90 <= 0.50 * 2.60 = 1.30 → profit close
+with (
+    patch("spread_monitor.load_state", return_value={"spread_positions": [spread_position]}),
+    patch("spread_monitor.save_state"),
+    patch("spread_monitor.append_log"),
+):
+    spread_actions = spread_monitor.process(
+        spread_position, spread_chains, [], make_trading_days(), dry_run=True
+    )
+check("2-leg close emitted", len(spread_actions) == 1)
+check("is mleg order", spread_actions[0].get("order_class") == "mleg")
+check("has 2 legs", len(spread_actions[0].get("legs", [])) == 2)
+
+
+# ── Iron condor: 50% profit close ────────────────────────────────────────────
+
+scenario("15. Iron condor at 50% profit -> 4-leg close emitted")
+NET_CREDIT_CONDOR = 3.20
+MAX_RISK_CONDOR = round((5 * 100) - NET_CREDIT_CONDOR * 100, 2)
+
+SHORT_PUT_STRIKE  = 470
+LONG_PUT_STRIKE   = 465
+SHORT_CALL_STRIKE = 530
+LONG_CALL_STRIKE  = 535
+SHORT_PUT_SYM  = f"{TICKER}{EXPIRY_OCC}P{int(SHORT_PUT_STRIKE  * 1000):08d}"
+LONG_PUT_SYM   = f"{TICKER}{EXPIRY_OCC}P{int(LONG_PUT_STRIKE   * 1000):08d}"
+SHORT_CALL_SYM = f"{TICKER}{EXPIRY_OCC}C{int(SHORT_CALL_STRIKE * 1000):08d}"
+LONG_CALL_SYM  = f"{TICKER}{EXPIRY_OCC}C{int(LONG_CALL_STRIKE  * 1000):08d}"
+
+condor_position = {
+    "id": f"{TICKER}-condor-smoke",
+    "symbol": TICKER,
+    "strategy": "iron_condor",
+    "short_put_contract":  SHORT_PUT_SYM,
+    "long_put_contract":   LONG_PUT_SYM,
+    "short_call_contract": SHORT_CALL_SYM,
+    "long_call_contract":  LONG_CALL_SYM,
+    "short_put_strike": SHORT_PUT_STRIKE, "long_put_strike": LONG_PUT_STRIKE,
+    "short_call_strike": SHORT_CALL_STRIKE, "long_call_strike": LONG_CALL_STRIKE,
+    "wing_width": 5,
+    "net_credit": NET_CREDIT_CONDOR,
+    "max_risk": MAX_RISK_CONDOR,
+    "expiry_date": EXPIRY_ISO,
+    "cycle_start": "2026-05-15",
+    "order_status": "filled",
+    "adjustment_count": 0,
+}
+
+condor_chains = {
+    TICKER: {
+        "puts": {
+            SHORT_PUT_SYM:  {"latestQuote": {"ap": 0.80, "bp": 0.72}},
+            LONG_PUT_SYM:   {"latestQuote": {"ap": 0.22, "bp": 0.20}},
+        },
+        "calls": {
+            SHORT_CALL_SYM: {"latestQuote": {"ap": 0.80, "bp": 0.72}},
+            LONG_CALL_SYM:  {"latestQuote": {"ap": 0.22, "bp": 0.20}},
+        },
+    }
+}
+# put_debit = 0.80-0.20=0.60, call_debit=0.80-0.20=0.60, total=1.20 <= 0.5*3.20=1.60 → profit
+with (
+    patch("condor_monitor.load_state", return_value={"condor_positions": [condor_position]}),
+    patch("condor_monitor.save_state"),
+    patch("condor_monitor.append_log"),
+):
+    condor_actions = condor_monitor.process(
+        condor_position, condor_chains, [], make_trading_days(), dry_run=True
+    )
+check("4-leg close emitted", len(condor_actions) == 1)
+check("is mleg order", condor_actions[0].get("order_class") == "mleg")
+check("has 4 legs", len(condor_actions[0].get("legs", [])) == 4)
+
+
+# ── Iron condor: untested-side roll ──────────────────────────────────────────
+
+scenario("16. Iron condor put side tested -> call roll descriptor emitted")
+# put side: short_put_ask=3.50, long_put_bid=0.20 → debit=3.30 > 0.5*5=2.50 → tested
+# call side: 0.80-0.20=0.60 < 2.50 → fine
+condor_roll_chains = {
+    TICKER: {
+        "puts": {
+            SHORT_PUT_SYM:  {"latestQuote": {"ap": 3.50, "bp": 3.15}},
+            LONG_PUT_SYM:   {"latestQuote": {"ap": 0.22, "bp": 0.20}},
+        },
+        "calls": {
+            SHORT_CALL_SYM: {"latestQuote": {"ap": 0.80, "bp": 0.72}},
+            LONG_CALL_SYM:  {"latestQuote": {"ap": 0.22, "bp": 0.20}},
+        },
+    }
+}
+# put_debit=3.30, call_debit=0.60, total=3.90 → loss=(3.90-3.20)*100=70 < max_risk=180
+# profit: 3.90 > 1.60 → no profit close. So roll should emit.
+with (
+    patch("condor_monitor.load_state", return_value={"condor_positions": [condor_position]}),
+    patch("condor_monitor.save_state"),
+    patch("condor_monitor.append_log"),
+):
+    roll_actions = condor_monitor.process(
+        condor_position, condor_roll_chains, [], make_trading_days(), dry_run=True
+    )
+roll_descs = [a for a in roll_actions if a.get("_meta", {}).get("action") == "roll_untested_side"]
+check("untested-side roll emitted", len(roll_descs) == 1)
+check("roll targets call side", roll_descs[0]["_meta"]["side"] == "call" if roll_descs else False)
+
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 print(f"\n{'='*50}")
@@ -211,5 +391,5 @@ if _failures:
         print(f"  • {f}")
     sys.exit(1)
 else:
-    total = 12  # number of scenario blocks
+    total = 16  # number of scenario blocks
     print(f"All smoke tests passed")
